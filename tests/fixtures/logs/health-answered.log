@@ -1,0 +1,10 @@
+# SYNTHETIC fixture (see README.txt): the health pair 0x53, 0x4A answered. Not a hardware capture.
+[    0.3s] Hosting a buffer script. On the Switch choose Mystery Gift -> Wonder Cards -> Friend.
+[   11.8s] A console joined the network.
+[   15.0s] Buffer script status: 0x00000001 (1) - the payload returned 1 and answered
+[   15.3s] Buffer script dump: 177 bytes of console memory, head 31535653020000003253565300000000
+[   15.3s]   0x53: r0..r3 00000000 00000000 00000000 00000000
+[   15.3s]   0x4A: r0..r3 00000000 00000000 00000000 00000000
+[   15.3s]   data after the last call: b''
+[   16.9s] Switch sent the RFU disconnect frame (D) in done: the normal close.
+wrote 177 bytes of console memory to captures/m1mu2/health.bin

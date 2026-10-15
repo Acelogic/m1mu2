@@ -1,0 +1,6 @@
+# SYNTHETIC fixture (see README.txt): an 8-call sloop-svc join that faulted. Not a hardware capture.
+[    0.3s] Hosting a buffer script. On the Switch choose Mystery Gift -> Wonder Cards -> Friend.
+[   12.1s] A console joined the network.
+[   14.6s] Switch sent the RFU disconnect frame (D) while the host is in serving; it leaves LDN next. What the host sent just before this is the cause.
+[   14.6s]   a block send was IN FLIGHT when it left: sending frag 2
+[   44.6s] No meaningful Switch traffic for 30s; stopping host.
