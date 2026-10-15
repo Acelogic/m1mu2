@@ -153,6 +153,8 @@ Observed in `pokeldn-src/` while building this milestone; m1mu² follows the cod
 .venv/bin/python -m pytest
 ```
 
-No hardware, no subprocess of the host, no `sudo`. Result-parser fixtures are **synthetic** —
-answer blocks and logs built to the documented formats, since no real captures exist yet — and
-upstream's Unicorn self-tests do not run here (`unicorn` is not in the venv).
+No hardware, no subprocess of the host, no `sudo`. Most result-parser fixtures are **synthetic**
+(answer blocks and logs built to the documented formats), so they can cover crashes, ghosts and
+stops. `tests/fixtures/real/` holds the first hardware capture, the answered health join of
+2026-10-15, which `tests/test_real_capture.py` classifies. Upstream's Unicorn self-tests do not run
+here (`unicorn` is not in the venv).
