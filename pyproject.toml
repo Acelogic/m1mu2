@@ -1,0 +1,16 @@
+[project]
+name = "m1mu2"
+version = "0.1.0"
+description = "Bench orchestrator for FireRed Mystery Gift memory-read probes over frlg_mg_host.py"
+requires-python = ">=3.13"
+
+[project.scripts]
+m1mu2 = "m1mu2.cli:main"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+norecursedirs = ["pokeldn-src", ".venv", "captures"]
+
+[tool.pyright]
+extraPaths = ["pokeldn-src"]
+exclude = ["pokeldn-src", ".venv"]
