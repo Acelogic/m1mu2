@@ -1,0 +1,5 @@
+# The verification readers: swi 0x53 (status-screen exit flag) and swi 0x4A (connect-period hold
+# during SEARCH_PARENT). Both answer-only on hardware [pokeldn-src/docs/frlg_rom.md]. First live
+# join of any bench session, and what m1mu2 schedules after every risky join.
+.svc 0x53 0x4A
+.go health

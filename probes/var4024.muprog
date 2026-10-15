@@ -1,0 +1,6 @@
+# Three reads in one call-chain join: the game's own pointer to var 0x4024, the u16 behind it,
+# and gRngValue on an English cartridge (0x030042D0; French is 0x03004220) [builds.py].
+.call GetVarPointer 0x4024
+.peek prev 2
+.peek 0x030042D0
+.go var4024
