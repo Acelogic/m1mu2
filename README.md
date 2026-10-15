@@ -21,7 +21,8 @@ m1mu2> .go var4024
   every join stops at a confirmation prompt that restates the console precondition (Mystery Gift →
   friends search/waiting screen, set up by hand). Every command line — dry or live — is first run
   through the host's own option parser, run config and payload build in-process
-  (`m1mu2.upstream.check_host_argv`), so anything the host would refuse is refused before `sudo`.
+  (`m1mu2.upstream.check_host_argv`), so anything the host would refuse is refused before the host
+  starts.
 - **Reads only by default.** `m1mu2/policy.py` is narrower than the host's guards and runs on top
   of them, never instead of them:
   - syscalls: only those seen answering without side effects on hardware — `0x49 0x4A 0x4B 0x50
@@ -37,9 +38,13 @@ m1mu2> .go var4024
   ReplaceSector) and `bkpt #0x52`.
 - **Nothing is left behind by default.** The payloads and their result blocks live in EWRAM
   (`gDecompressionBuffer` and the scratch above it) and are gone at power-off. No default program
-  writes the console's memory, its save, or flash; the cartridge ROM is never written. *Not
-  verified here:* whether the game itself commits its normal save at the end of a buffer-script
-  Mystery Gift session — m1mu² does not change that behaviour either way.
+  writes the console's memory, its save, or flash; the cartridge ROM is never written.
+- **The game saves at the end of every join.** The host logs of the first live joins (2026-10-15)
+  show the game doing its own normal save as each buffer-script session closes: "Console finished
+  the gift and asked to close the link; holding the network open while it saves.", then "The
+  console printed our message and saved." That is the game's own end-of-Mystery-Gift save of
+  whatever state it is in, not a write by the payload or by m1mu², and m1mu² can neither skip nor
+  change it. The host's buffer-script path sends no Wonder Card and replaces none.
 - **Join economy.** Two live joins per invocation by default (`--budget N`). A *risky* join —
   anything that needed the override, or a read through a pointer the console fetched from memory —
   is always followed by the health pair (`swi 0x53, 0x4A`), and the schedule is refused up front if
@@ -52,20 +57,25 @@ m1mu2> .go var4024
 
 ## Quickstart (once hardware is present)
 
-Run the rig's identity and heartbeat checks from CLAUDE.md's appendix first (esptool `read_mac`
-with `--after hard-reset`, then `ldn_scan.py`), put the console on Mystery Gift → friends search,
-then:
+The venv needs everything in `requirements.txt` (`pytest` fails if the live path's imports do not
+resolve). Run the rig's identity and heartbeat checks from CLAUDE.md's appendix first (esptool
+`read_mac` with `--after hard-reset`, then `ldn_scan.py`), put the console on Mystery Gift →
+friends search, then:
 
 ```bash
 .venv/bin/python -m m1mu2.cli run probes/health.muprog
 ```
 
 ```bash
-.venv/bin/python -m m1mu2.cli run probes/health.muprog --live --mac 20:50:0d:d1:15:20
+.venv/bin/python -m m1mu2.cli run probes/health.muprog --live --no-sudo --mac 20:50:0d:d1:15:20
 ```
 
 The first prints the exact command and the host's verdict on it; the second fires it after your
-confirmation (`sudo -nE` needs cached credentials: run `sudo -v` yourself beforehand).
+confirmation. `--no-sudo` runs the host as you instead of under `sudo -nE`: the ESP32 path does
+not need root (item 8 below), and your captures stay owned by you. Without it, `sudo -nE` needs
+cached credentials, and macOS caches them per terminal: a `sudo -v` only counts in the terminal
+that then runs m1mu², and a shell with no terminal (an agent's) never has any, so the join comes
+back `not-started`.
 
 ## What a join is
 
@@ -95,7 +105,7 @@ budget, ⌈log₂ N⌉ probes worst case. It never spends joins on bisection by 
 | `m1mu2/upstream.py` | imports `pokeldn-src` in place; `check_host_argv` = the host's own validation, offline |
 | `m1mu2/policy.py` | what goes without `--allow-unsafe`, and what never goes |
 | `m1mu2/pack.py` | steps → joins → buffer-script argv, and back (`join_from_host_args`) |
-| `m1mu2/session.py` | budget, verify-after-risk scheduling, confirm gate, `sudo -nE` invocation, tee |
+| `m1mu2/session.py` | budget, verify-after-risk scheduling, confirm gate, host invocation (`sudo -nE` or `--no-sudo`), tee |
 | `m1mu2/result.py` | answer blocks via upstream parsers, log classification, bisection |
 | `m1mu2/journal.py`, `m1mu2/replay.py` | append-only JSONL journal and offline replay |
 | `m1mu2/cli.py` | `repl` and `run FILE.muprog` |
@@ -121,13 +131,21 @@ Observed in `pokeldn-src/` while building this milestone; m1mu² follows the cod
 6. The health pair's docs: 0x53 = status-screen exit flag, 0x4A = connect-period hold during
    SEARCH_PARENT. Both answer-only, but neither is documented as "park-check / error-flag".
 7. Exit status: the host returns 0 only when a console joined and the engine succeeded; no console
-   → 1, Ctrl-C → 130, `--idle-timeout` → 124. CLAUDE.md says ghost runs exit 0.
-8. Root: `pokeldn.host_support.needs_root()` is False whenever `POKELDN_RADIO=esp32:…` is set, so
-   the host's own "requires root" error appears only when that variable was lost (e.g. `sudo`
-   without `-E`). m1mu² keeps `sudo -nE` as specified; whether the ESP32 path needs root at all is
-   untested.
-9. Paths: the stack lives at `pokeldn-src/`, not `pocs/FireRedPoC/…`; there is no
-   `pokeldn-esp32-rig` skill here; `unicorn` is absent from the venv; no real captures exist.
+   → 1, Ctrl-C → 130, `--idle-timeout` → 124. CLAUDE.md says ghost runs exit 0. Live, both
+   answered joins of 2026-10-15 exited 0.
+8. Root is not needed on the ESP32 path. `pokeldn.host_support.needs_root()` is False whenever
+   `POKELDN_RADIO=esp32:…` is set, so the host's own "requires root" error appears only when that
+   variable was lost (e.g. `sudo` without `-E`). Verified live on 2026-10-15: the same health join
+   answered identically under `sudo -nE` and with `--no-sudo` (same registers, byte-identical
+   `.bin`). m1mu² keeps `sudo -nE` as the default because the brief asks for it; `--no-sudo` drops
+   it and is what the quickstart uses. Under `sudo` the host writes a root-owned `.bin`.
+9. Paths and environment: the stack lives at `pokeldn-src/`, not `pocs/FireRedPoC/…`; there is no
+   `pokeldn-esp32-rig` skill here; `unicorn` is absent from the venv. The venv also could not run
+   the live path at all: `python-netlink==0.0.15` (pinned by `pokeldn-src/vendor/LDN/setup.py`,
+   imported by `ldn.wlan`) and `zstandard==0.25.0` (`pokeldn-src/requirements.txt`) were missing,
+   so `ldn_scan.py` died on `import netlink` and the host would have too, after `go`. Every offline
+   test stops before the transport, so nothing caught it. Both are now in `requirements.txt`, and
+   `tests/test_env.py` imports the live path's modules so a venv without them fails `pytest`.
 
 ## Tests
 
