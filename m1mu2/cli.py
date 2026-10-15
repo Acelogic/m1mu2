@@ -231,6 +231,9 @@ def _parser():
                         help="the ESP32 radio's serial port (default %(default)s)")
     common.add_argument("--mac", default=None, metavar="MAC",
                         help="the radio's MAC from `esptool read_mac`, for the journal")
+    common.add_argument("--no-sudo", dest="sudo", action="store_false",
+                        help="run the host as yourself instead of under `sudo -nE` (the host "
+                             "asks for root only when POKELDN_RADIO is not the ESP32 board)")
     common.add_argument("--captures", type=Path, default=CAPTURES_DIR, metavar="DIR",
                         help="where logs and dumps land (default captures/m1mu2)")
     common.add_argument("--journal", type=Path, default=None, metavar="PATH",
@@ -324,7 +327,7 @@ def main(argv=None, *, journal_factory=None, **session_kwargs):
     session = Session(budget=args.budget, allow_unsafe=args.allow_unsafe,
                       live=args.live and not args.dry_run, keys=args.keys, port=args.port,
                       captures_dir=args.captures, journal=journal, radio_mac=args.mac,
-                      **session_kwargs)
+                      sudo=args.sudo, **session_kwargs)
     shell = Shell(session, out=session.out)
     shell.out(_banner(session))
     if args.command == "repl":

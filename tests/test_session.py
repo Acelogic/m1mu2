@@ -170,6 +170,14 @@ def test_host_argv_paths_are_absolute_and_expect_console_optional(tmp_path, monk
     assert inv.command()[:2] == list(SUDO)
 
 
+def test_sudo_false_execs_the_venv_python_directly(tmp_path):
+    session, _ = make(tmp_path, sudo=False)
+    inv = session.invocation(var4024()[0])
+    assert inv.command()[:3] == [str(VENV_PYTHON), "-u", str(HOST_SCRIPT)]
+    assert inv.env() == {"POKELDN_RADIO": "esp32:/dev/cu.usbserial-0001"}
+    assert "sudo -nE" not in inv.render()
+
+
 # -- scheduling ---------------------------------------------------------------------------------
 
 def test_risky_join_gets_the_health_pair(tmp_path):

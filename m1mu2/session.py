@@ -37,7 +37,9 @@ DEFAULT_PORT = "/dev/cu.usbserial-0001"
 DEFAULT_BUDGET = 2
 # Live hosting is run as root, and -E keeps POKELDN_RADIO through sudo: without it the host never
 # sees the board and fails with a misleading "visible PHYs: none". -n fails instead of prompting
-# for a password into a tee'd pipe; cache credentials with `sudo -v` first.
+# for a password into a tee'd pipe; cache credentials with `sudo -v` first, in the same terminal
+# (macOS sudo caches per tty). sudo=False (--no-sudo) runs the host as the operator: the host's own
+# needs_root() is False whenever POKELDN_RADIO names the ESP32 board.
 SUDO = ("sudo", "-nE")
 PRECONDITION = ("The console must sit on Mystery Gift -> friends search/waiting screen (set it up "
                 "by hand and confirm visually).")
@@ -86,6 +88,7 @@ class Invocation:
     bin_path: Path
     stderr_path: Path
     expect_console: str | None = "firered"
+    sudo: bool = True
 
     def host_argv(self):
         """Everything after the script path. --expect-console makes the host refuse (send
@@ -97,7 +100,8 @@ class Invocation:
 
     def command(self):
         """The argv to exec. -u: unbuffered, so the tee'd log streams line by line."""
-        return [*SUDO, str(VENV_PYTHON), "-u", str(HOST_SCRIPT), *self.host_argv()]
+        return [*(SUDO if self.sudo else ()), str(VENV_PYTHON), "-u", str(HOST_SCRIPT),
+                *self.host_argv()]
 
     def env(self):
         """What the command needs on top of the caller's environment: the radio board."""
@@ -204,7 +208,7 @@ class Session:
     def __init__(self, *, budget=DEFAULT_BUDGET, allow_unsafe=False, live=False, keys=DEFAULT_KEYS,
                  port=DEFAULT_PORT, captures_dir=CAPTURES_DIR, journal=None, confirm=None,
                  runner=None, load_outcome=None, bisection_plan=None, out=print,
-                 radio_mac=None, expect_console="firered", now=None):
+                 radio_mac=None, expect_console="firered", sudo=True, now=None):
         self.budget = int(budget)
         self.allow_unsafe = bool(allow_unsafe)
         self.live = bool(live)
@@ -214,6 +218,7 @@ class Session:
         self.out = out
         self.radio_mac = radio_mac
         self.expect_console = expect_console
+        self.sudo = bool(sudo)
         self.confirm = confirm or _ask_go
         self.runner = runner or functools.partial(run_host, out=out)
         self._journal = journal
@@ -294,7 +299,8 @@ class Session:
             paths, n = capture_paths(self.captures_dir, f"{label}-{n}", stamp), n + 1
         if reserve:
             self._reserved.update(paths)
-        return Invocation(join, self.keys, self.port, *paths, expect_console=self.expect_console)
+        return Invocation(join, self.keys, self.port, *paths, expect_console=self.expect_console,
+                          sudo=self.sudo)
 
     def _refuse(self, join, inv, message):
         self.stopped = STOP_REFUSED

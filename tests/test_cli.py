@@ -175,6 +175,21 @@ def test_live_run_with_fakes(tmp_path, capsys):
     assert made[0].rows[1]["exit_status"] == 1 and made[0].rows[1]["verdict"] == "answered"
 
 
+def test_no_sudo_drops_sudo_from_render_and_runner(tmp_path, capsys):
+    keys = tmp_path / "prod.keys"
+    keys.write_text("not a key\n")
+    made, fired = [], []
+    status = cli.main(["run", str(PROGRAMS / "var4024.muprog"), "--live", "--no-sudo",
+                       "--keys", str(keys), "--captures", str(tmp_path)],
+                      journal_factory=lambda p: made.append(FakeJournal(p)) or made[-1],
+                      now=FIXED, runner=lambda inv: fired.append(inv) or 0,
+                      confirm=lambda prompt: True, load_outcome=answered)
+    out = capsys.readouterr().out
+    assert status == 0 and "sudo -nE" not in out
+    assert fired[0].command()[:2] == [str(VENV_PYTHON), "-u"]
+    assert made[0].rows[0]["command"][0] == str(VENV_PYTHON)
+
+
 def test_live_decline_stops_the_file(tmp_path, capsys):
     keys = tmp_path / "prod.keys"
     keys.write_text("not a key\n")
