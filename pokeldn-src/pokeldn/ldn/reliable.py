@@ -1,0 +1,483 @@
+"""Pia message tiling and the Reliable (10) sub-header (docs/pia.md).
+
+A decrypted, decompressed blob is <message>* <2-byte recipient station id> <0xff padding>; a
+header field whose presence bit is clear inherits the previous message's value.
+"""
+
+from dataclasses import dataclass, field
+
+PROTO_NAMES = {1: "Net", 3: "RTT", 4: "Sync", 5: "Unreliable",
+               9: "Clock", 10: "Reliable", 13: "Session"}
+PROTO_RELIABLE = 10
+
+# The footer is the recipient's var id: a guest-to-host blob ends in STATION_HOST.
+STATION_HOST = 0x7620
+STATION_JOINER = 0xc493
+
+# flagsA: 1 AppData, 2 MsgStart, 4 MsgEnd, 8 Initialized; this title uses no other bit.
+FLAGSA_GBA = 0x07
+FLAGSA_INIT = 0x0f      # stream-opening frame; the peer ignores DATA until it sees one
+FLAGSA_CTRL = 0x00
+
+# Milliseconds.
+RTO_BASE_MS = 33        # also the delayed-ack interval
+RTO_RTT_FACTOR = 1.4  # RTO = BASE + FACTOR * median(RTT); no backoff, no clamp
+RTT_WINDOW = 7
+FAST_RETX_MIN_MS = 25  # between two fast-retransmits of one hole, or the median RTT
+MAX_INFLIGHT = 128      # the selective-ack mask spans 128 sequence ids
+
+# The emulator's first Reliable payload: title and version metadata on the INIT frame.
+METADATA_FRAME = bytes.fromhex("4a002a005801004c656166477265656e5f65" + "00" * 28)
+
+
+def build_bulk_ack(next_expected, mask=b"\x00" * 16, stream_id=0):
+    """`<stream_id> 01 <next_expected:2 BE> <16-byte mask>`; unicast carries one entry."""
+    return bytes([stream_id & 0xFF, 1]) + (next_expected & 0xFFFF).to_bytes(2, "big") + mask
+
+
+def parse_bulk_ack(payload):
+    """-> (ack_id, mask): everything below ack_id is acked; mask bit i means ack_id+i+1 arrived.
+    Measured: reading `ack_id+i` marks the console's own hole as received."""
+    if len(payload) < 4:
+        return None, b""
+    return int.from_bytes(payload[2:4], "big"), payload[4:20].ljust(16, b"\x00")
+
+
+# Bit i of a bulk-ack mask is ack_id + i + MASK_ORIGIN_OFFSET; one codec reads and writes.
+MASK_ORIGIN_OFFSET = 1
+
+
+def _seq_lt(a, b):
+    d = (b - a) & 0xFFFF
+    return d != 0 and d < 0x8000
+
+
+# send entry = [flagsA, inner, last_tx_ms, resends, acked]
+_E_FLAGS, _E_INNER, _E_LASTTX, _E_RESENDS, _E_ACKED = range(5)
+
+
+class ReliableLink:
+    """Selective-repeat window, one per peer. `window_lo` is the header's lowest-pending-ack."""
+
+    def __init__(self, start=0xFFF0, max_inflight=MAX_INFLIGHT, rtt_jitter_k=0.0,
+                 dup_nack_threshold=1, rto_ceil_ms=None, rto_backoff=1.0, rto_bootstrap_ms=None):
+        """Defaults are the console's algorithm. rtt_jitter_k adds K*MAD(RTT) to the RTO;
+        rto_bootstrap_ms is the RTO before the first RTT sample only."""
+        self.out_seq = start
+        self.window_lo = start
+        self.unacked = {}
+        self.recv_next = start
+        self.recv_buf = {}
+        self.recv_ooo = set()
+        self.max_inflight = max_inflight
+        self._rtt = []
+        self._rtt_jitter_k = rtt_jitter_k
+        self._dup_nack_threshold = max(1, dup_nack_threshold)
+        self._rto_ceil_ms = rto_ceil_ms
+        self._rto_backoff = rto_backoff
+        self._rto_bootstrap_ms = rto_bootstrap_ms
+        self._peer_gap = None
+        self._gap_nacks = 0
+
+    def inflight(self):
+        return len(self.unacked)
+
+    def outstanding(self):
+        """Frames the peer has not acked. inflight() also counts acked frames held behind a hole;
+        gating sends on that throttles for nothing."""
+        return sum(1 for e in self.unacked.values() if not e[_E_ACKED])
+
+    def send_low(self):
+        return self.window_lo if self.unacked else self.out_seq
+
+    def queue(self, inner, flagsA, now_ms):
+        seq = self.out_seq
+        self.out_seq = (self.out_seq + 1) & 0xFFFF
+        self.unacked[seq] = [flagsA, inner, now_ms, 0, False]
+        return seq
+
+    def add_rtt_sample(self, rtt_ms):
+        if rtt_ms is None or rtt_ms < 0:
+            return
+        self._rtt.append(float(rtt_ms))
+        if len(self._rtt) > RTT_WINDOW:
+            self._rtt = self._rtt[-RTT_WINDOW:]
+
+    def rto(self):
+        """BASE + FACTOR*median(RTT) [+ K*MAD], clamped by rto_ceil_ms; None before a sample
+        unless rto_bootstrap_ms is set. No floor: a floor measured about 2x slower."""
+        if self._rtt:
+            s = sorted(self._rtt)
+            median = s[len(s) // 2]
+            rto = RTO_BASE_MS + RTO_RTT_FACTOR * median
+            if self._rtt_jitter_k:
+                mad = sum(abs(x - median) for x in self._rtt) / len(self._rtt)
+                rto += self._rtt_jitter_k * mad
+        elif self._rto_bootstrap_ms is not None:
+            rto = self._rto_bootstrap_ms
+        else:
+            return None
+        if self._rto_ceil_ms is not None:
+            rto = min(rto, self._rto_ceil_ms)
+        return rto
+
+    def on_ack(self, ack_id, mask=None, now_ms=None):
+        """The window base advances only over the contiguous acked run. A first ack of an
+        unretransmitted frame is an RTT sample, from the mask too (no head-of-line bias)."""
+        if ack_id is None:
+            return
+        maskint = int.from_bytes(mask, "little") if mask else 0
+        for seq, entry in self.unacked.items():
+            arrived = _seq_lt(seq, ack_id)
+            if not arrived and maskint:
+                # A wrong mask origin marks the peer's real hole as acked: never retransmitted, the
+                # window never advances.
+                i = (seq - ack_id - MASK_ORIGIN_OFFSET) & 0xFFFF
+                arrived = i < 128 and bool((maskint >> i) & 1)
+            if arrived and not entry[_E_ACKED]:
+                if now_ms is not None and entry[_E_RESENDS] == 0:
+                    self.add_rtt_sample(now_ms - entry[_E_LASTTX])
+                entry[_E_ACKED] = True
+        while self.window_lo in self.unacked and self.unacked[self.window_lo][_E_ACKED]:
+            del self.unacked[self.window_lo]
+            self.window_lo = (self.window_lo + 1) & 0xFFFF
+        if maskint and ack_id in self.unacked and not self.unacked[ack_id][_E_ACKED]:
+            if ack_id == self._peer_gap:
+                self._gap_nacks += 1
+            else:
+                self._peer_gap = ack_id
+                self._gap_nacks = 1
+        else:
+            self._peer_gap = None
+            self._gap_nacks = 0
+
+    def _fast_retx_gap(self):
+        if self._rtt:
+            s = sorted(self._rtt)
+            return max(FAST_RETX_MIN_MS, s[len(s) // 2])
+        return FAST_RETX_MIN_MS
+
+    def due_retransmits(self, now_ms, limit=None):
+        """Oldest-first unacked frames due, stamped. The peer's hole is fast-retransmitted at once,
+        then one round trip apart; timer resend at rto()*backoff**resends. `limit` stops at the
+        first frame not yet due."""
+        base_rto = self.rto()
+        out = []
+        for seq in sorted(self.unacked, key=lambda s: (s - self.window_lo) & 0xFFFF):
+            entry = self.unacked[seq]
+            if entry[_E_ACKED]:
+                continue
+            if (seq == self._peer_gap and self._gap_nacks >= self._dup_nack_threshold
+                    and (entry[_E_RESENDS] == 0
+                         or (now_ms - entry[_E_LASTTX]) >= self._fast_retx_gap())):
+                due = True
+                self._gap_nacks = 0
+            elif base_rto is None:
+                due = False
+            else:
+                eff_rto = base_rto * (self._rto_backoff ** entry[_E_RESENDS])
+                if self._rto_ceil_ms is not None:
+                    eff_rto = min(eff_rto, self._rto_ceil_ms)
+                due = (now_ms - entry[_E_LASTTX]) >= eff_rto
+            if due:
+                entry[_E_LASTTX] = now_ms
+                entry[_E_RESENDS] += 1
+                out.append((seq, entry[_E_FLAGS], entry[_E_INNER]))
+                if limit is not None and len(out) >= limit:
+                    break
+            elif limit is not None:
+                break
+        return out
+
+    def on_data(self, seq, payload):
+        """Offline path: deliver in order, buffering across a gap."""
+        if seq == self.recv_next:
+            out = [payload]
+            self.recv_next = (self.recv_next + 1) & 0xFFFF
+            while self.recv_next in self.recv_buf:
+                out.append(self.recv_buf.pop(self.recv_next))
+                self.recv_next = (self.recv_next + 1) & 0xFFFF
+            return out
+        if _seq_lt(self.recv_next, seq):
+            self.recv_buf[seq] = payload
+        return []
+
+    def note_received(self, seq):
+        """Live path: advance recv_next without delivery; keep out-of-order seqs for the mask."""
+        if seq == self.recv_next:
+            self.recv_next = (self.recv_next + 1) & 0xFFFF
+            while self.recv_next in self.recv_ooo:
+                self.recv_ooo.discard(self.recv_next)
+                self.recv_next = (self.recv_next + 1) & 0xFFFF
+        elif _seq_lt(self.recv_next, seq):
+            self.recv_ooo.add(seq)
+
+    def ack_payload(self):
+        """Cumulative recv_next and a mask of recv_ooo, bit i meaning recv_next+i+1."""
+        mask = bytearray(16)
+        for s in self.recv_ooo:
+            i = (s - self.recv_next - MASK_ORIGIN_OFFSET) & 0xFFFF
+            if i < 128:
+                mask[i >> 3] |= (1 << (i & 7))
+        return build_bulk_ack(self.recv_next, bytes(mask))
+
+
+@dataclass(frozen=True)
+class ReliableEmission:
+    seq: int
+    flagsA: int
+    ack: int
+    payload: bytes
+    retransmitted: bool = False
+
+    @property
+    def message_flags(self):
+        # Both native peers set Pia message flag 0x40 on pure bulk acks and 0x20 on retransmits.
+        if self.flagsA == FLAGSA_CTRL:
+            return 0x40
+        return 0x20 if self.retransmitted else None
+
+    def serialize(self):
+        return build_reliable(self.seq, self.ack, self.payload, self.flagsA)
+
+
+@dataclass(frozen=True)
+class ReliableDelivery:
+    seq: int
+    flagsA: int
+    payload: bytes
+
+
+class HostReliableSession:
+    """Pia Reliable leader. Both streams start at FFF0; the native leader opens with its RFU 'A'
+    accept as an Initialized DATA frame, the joiner with the title metadata."""
+
+    def __init__(self, start=0xFFF0, *, ack_period_ms=RTO_BASE_MS,
+                 max_inflight=MAX_INFLIGHT, rto_bootstrap_ms=200,
+                 dup_nack_threshold=1, retransmit_limit=None):
+        self.start_seq = start & 0xFFFF
+        self.link = ReliableLink(
+            start=self.start_seq,
+            max_inflight=max_inflight,
+            rto_bootstrap_ms=rto_bootstrap_ms,
+            dup_nack_threshold=dup_nack_threshold,
+        )
+        self.ack_period_ms = float(ack_period_ms)
+        self.retransmit_limit = retransmit_limit
+        self.local_opened = False
+        self.peer_opened = False
+        self._ack_owed = False
+        self._next_ack_ms = None
+
+        # Delivery order is kept apart from the ack accounting, which advances at once.
+        self._deliver_next = self.start_seq
+        self._deliver_buf = {}
+
+    @property
+    def inflight(self):
+        return self.link.inflight()
+
+    @property
+    def recv_next(self):
+        return self.link.recv_next
+
+    def _emission(self, seq, flagsA, payload, *, retransmitted=False):
+        # The window base is sampled at emission, retransmissions included.
+        return ReliableEmission(seq & 0xFFFF, flagsA, self.link.send_low(), bytes(payload),
+                                retransmitted=retransmitted)
+
+    def open(self, payload, now_ms, flagsA=FLAGSA_GBA):
+        """Idempotent: a duplicate child 'C' must not allocate a second opening sequence id."""
+        if self.local_opened:
+            return None
+        flagsA = (int(flagsA) | FLAGSA_INIT) & 0xFF
+        payload = bytes(payload)
+        seq = self.link.queue(payload, flagsA, now_ms)
+        self.local_opened = True
+        return self._emission(seq, flagsA, payload)
+
+    def send(self, payload, now_ms, flagsA=FLAGSA_GBA):
+        """Raises on a full window, so backpressure is explicit."""
+        if not self.local_opened:
+            raise RuntimeError("Reliable stream has not been opened")
+        if self.link.inflight() >= self.link.max_inflight:
+            raise BufferError("Reliable send window is full")
+        flagsA = int(flagsA) & 0xFF
+        if not (flagsA & 0x01):
+            raise ValueError("send() is for Reliable DATA frames, not control ACKs")
+        seq = self.link.queue(bytes(payload), flagsA, now_ms)
+        return self._emission(seq, flagsA, payload)
+
+    def note_rtt(self, rtt_ms):
+        self.link.add_rtt_sample(rtt_ms)
+
+    def _deliver(self, frame):
+        seq = frame.seq
+        if seq == self._deliver_next:
+            ready = [ReliableDelivery(seq, frame.flagsA, bytes(frame.payload))]
+            self._deliver_next = (self._deliver_next + 1) & 0xFFFF
+            while self._deliver_next in self._deliver_buf:
+                buffered = self._deliver_buf.pop(self._deliver_next)
+                ready.append(ReliableDelivery(
+                    buffered.seq, buffered.flagsA, bytes(buffered.payload)))
+                self._deliver_next = (self._deliver_next + 1) & 0xFFFF
+            return ready
+        if _seq_lt(self._deliver_next, seq):
+            self._deliver_buf.setdefault(seq, frame)
+        return []
+
+    def receive(self, wire, now_ms):
+        """-> newly in-order DATA; control frames update the window and RTT and are never acked."""
+        frame = parse_reliable(bytes(wire))
+        if frame is None or frame.raw_len > len(wire) - 8:
+            return []
+        if not (frame.flagsA & 0x01):
+            ack_id, mask = parse_bulk_ack(frame.payload)
+            self.link.on_ack(ack_id, mask, now_ms=now_ms)
+            return []
+
+        # The fff0 opening DATA must carry Initialized; a plain frame taking that slot makes a later
+        # INIT look like a duplicate.
+        if (not self.peer_opened and frame.seq == self.start_seq
+                and not (frame.flagsA & 0x08)):
+            return []
+        if frame.flagsA & 0x08:
+            self.peer_opened = True
+        self.link.note_received(frame.seq)
+        self._ack_owed = True
+        if self._next_ack_ms is None:
+            self._next_ack_ms = float(now_ms) + self.ack_period_ms
+        return self._deliver(frame)
+
+    def poll(self, now_ms):
+        emissions = [
+            self._emission(seq, flagsA, payload, retransmitted=True)
+            for seq, flagsA, payload in self.link.due_retransmits(
+                now_ms, limit=self.retransmit_limit)
+        ]
+        ack_due = (self._next_ack_ms is not None
+                   and float(now_ms) >= self._next_ack_ms)
+        if ack_due and (self._ack_owed or self.link.recv_ooo):
+            emissions.append(ReliableEmission(
+                self.start_seq, FLAGSA_CTRL, self.link.send_low(),
+                self.link.ack_payload()))
+            self._ack_owed = False
+            # Keep NACKing a persistent gap at the delayed-ack cadence.
+            self._next_ack_ms = (float(now_ms) + self.ack_period_ms
+                                 if self.link.recv_ooo else None)
+        return emissions
+
+
+@dataclass
+class Message:
+    flags: int
+    proto: int
+    size: int
+    payload: bytes
+    msgflags: int = 0
+    hdr_bytes: bytes = b""
+
+    def serialize(self):
+        return self.hdr_bytes + self.payload
+
+
+def parse_messages(data):
+    msgs = []
+    i, n = 0, len(data)
+    mf, size, proto = 0, None, None
+    while i < n:
+        fl = data[i]
+        if fl == 0xff or (fl & 0xE0):
+            break
+        if fl == 0 and size is None:
+            break
+        hdr_start = i
+        j = i + 1
+        if fl & 1:
+            if j >= n:
+                break
+            mf = data[j]
+            j += 1
+        if fl & 2:
+            if j + 2 > n:
+                break
+            size = int.from_bytes(data[j:j + 2], "big")
+            j += 2
+        if fl & 4:
+            if j >= n:
+                break
+            proto = data[j]
+            j += 1
+        if fl & 8:
+            # 6.32-6.40: bit 0x8 is a 1-byte port; the older 8-byte u64 here mis-tiles the stream.
+            if j + 1 > n:
+                break
+            j += 1
+        if fl & 0x10:
+            # Z-A reads one byte, stored between protocol and port, at 0x256df54 (docs/pia.md).
+            if j + 1 > n:
+                break
+            j += 1
+        if size is None or j + size > n:
+            break
+        msgs.append(Message(flags=fl, msgflags=mf, proto=proto, size=size,
+                            payload=data[j:j + size], hdr_bytes=data[hdr_start:j]))
+        i = j + size
+    return msgs, i
+
+
+def build_message(proto, payload, msgflags=None):
+    """Size and proto are always set so the message parses standalone."""
+    flags = 0x02 | 0x04
+    hdr = bytearray()
+    if msgflags is not None:
+        flags |= 0x01
+    hdr.append(flags)
+    if msgflags is not None:
+        hdr.append(msgflags & 0xFF)
+    hdr += len(payload).to_bytes(2, "big")
+    hdr.append(proto & 0xFF)
+    return bytes(hdr) + payload
+
+
+@dataclass
+class Reliable:
+    """Big-endian: flags(1) size(2) seq(2) window_base(2) N(1) payload; N is the multicast
+    recipient count, 0 for unicast."""
+    flagsA: int
+    seq: int
+    ack: int
+    payload: bytes
+    raw_len: int = 0
+    recipients: int = 0
+
+    def serialize(self):
+        return (bytes([self.flagsA]) + len(self.payload).to_bytes(2, "big")
+                + self.seq.to_bytes(2, "big") + self.ack.to_bytes(2, "big")
+                + bytes([self.recipients & 0xFF]) + self.payload)
+
+
+def parse_reliable(payload):
+    if len(payload) < 8:
+        return None
+    ln = int.from_bytes(payload[1:3], "big")
+    return Reliable(flagsA=payload[0],
+                    seq=int.from_bytes(payload[3:5], "big"),
+                    ack=int.from_bytes(payload[5:7], "big"),
+                    payload=payload[8:8 + ln], raw_len=ln, recipients=payload[7])
+
+
+def build_reliable(seq, ack, inner, flagsA=FLAGSA_GBA, recipients=0):
+    """`recipients`: zero on a unicast stream, three on every Z-A Broadcast Reliable frame."""
+    return Reliable(flagsA=flagsA, seq=seq, ack=ack, payload=inner,
+                    recipients=recipients).serialize()
+
+
+def parse_app(data):
+    """-> (messages, station_id_or_None, tail_len)."""
+    msgs, consumed = parse_messages(data)
+    tail = data[consumed:]
+    stripped = tail.rstrip(b"\xff")
+    station = int.from_bytes(stripped, "big") if len(stripped) == 2 else None
+    return msgs, station, len(tail)
+

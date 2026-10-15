@@ -1,0 +1,7 @@
+capstone
+pyserial
+esptool
+pycryptodome
+keystone-engine
+pytest
+trio

@@ -1,0 +1,5 @@
+captures/
+*.pyc
+__pycache__/
+.venv/
+keys/

@@ -1,0 +1,702 @@
+"""The Pia connection handshake (Net, Session, RTT) a joiner completes before the host admits it.
+
+Variable ids are assigned per session and learned from the first packet: the header is
+[dst_var][src_var], the footer the destination var. A constant id is the 6-byte MAC plus 0000."""
+
+PROTO_NET = 1
+PROTO_RTT = 3
+PROTO_RELIABLE = 10
+PROTO_SESSION = 13
+
+# RTT and session control use header dst 0x0001, the session pseudo-station; the footer stays the
+# host var.
+SESSION_VAR = 0x0001
+RTT_ORIGINATE_PERIOD = 10
+
+NET_CONN_REQUEST = 0x11
+NET_CONN_RESPONSE = 0x12
+NET_UPDATE_PROPERTY = 0x50
+NET_UPDATE_PROPERTY_ACK = 0x51
+
+SESSION_JOIN_REQUEST = 0
+SESSION_JOIN_RESPONSE = 2
+SESSION_UPDATE = 5
+SESSION_UPDATE_ACK = 6
+SESSION_LEFT_SYNC = 7
+
+DEFAULT_PROTOCOLS = [(1, 0), (3, 5), (5, 1), (10, 3), (13, 7), (15, 0)]
+DEFAULT_APP_VER = bytes.fromhex("0058")
+DEFAULT_PLAYER_ID = bytes.fromhex("00000000000000010000000000000000")
+
+
+def _ip4(ip):
+    return bytes(int(x) for x in ip.split("."))
+
+
+def parse_net(payload):
+    if len(payload) < 4:
+        return None
+    # `size` is not the body length: Net 0x11 stores the NetStation array size, 0x12 zero.
+    return payload[0], payload[1], payload[4:]
+
+
+def build_net_response(seqid=2):
+    """Echo the host's 0x11 seqid; a fixed value leaves the host resending 0x11 every 500 ms."""
+    return bytes([0x01, NET_CONN_RESPONSE, 0x00, 0x00]) + (seqid & 0xFFFFFFFF).to_bytes(4, "big")
+
+
+def ldn_constant_id(mac):
+    mac = bytes(mac)
+    if len(mac) != 6:
+        raise ValueError("LDN constant id requires a 6-byte MAC")
+    return bytes((mac[2], mac[4], mac[5], mac[3], mac[1], mac[0], 0, 0))
+
+
+def _net_station(ip=None, port=12345, *, migration_state=0, migration_rank=0, prefix_len=4):
+    """A NetStation: prefix, 16-byte address (IPv4 first), big-endian port; empty is rank 0xff.
+    The prefix is 4 bytes at Pia 6.39 and 3 at 6.16-6.23 (docs/pla.md): 22 or 21 bytes a station."""
+    address = (_ip4(ip) + b"\x00" * 12) if ip is not None else b"\x00" * 16
+    if ip is None:
+        port = 0
+    prefix = bytes([migration_state & 0xFF, migration_rank & 0xFF]) + b"\x00" * (prefix_len - 2)
+    return prefix + address + (port & 0xFFFF).to_bytes(2, "big")
+
+
+def build_net_conn_request(seqid, host_var, host_mac, network_id, stations, max_stations=6,
+                           station_size=22):
+    """Net 0x11 carries all max_stations slots; the network id is the SSID CRC32 zero-extended to 8
+    bytes. `station_size` is 22 at Pia 6.39 (the GBA app) and 21 at 6.16-6.23 (Legends Arceus)."""
+    entries = list(stations)
+    if not 1 <= len(entries) <= max_stations:
+        raise ValueError("Net 0x11 needs 1..max_stations occupied station addresses")
+    prefix_len = station_size - 18
+    body = bytearray()
+    body += (seqid & 0xFFFFFFFF).to_bytes(4, "big")
+    body += (_vid(host_var) & 0xFFFF).to_bytes(2, "big")
+    body += ldn_constant_id(host_mac)
+    body += (network_id & 0xFFFFFFFF).to_bytes(8, "big")
+    body += bytes([1])
+    body += max_stations.to_bytes(2, "big")
+    body += bytes([0])
+    for rank, ip in enumerate(entries):
+        body += _net_station(ip, migration_rank=rank, prefix_len=prefix_len)
+    for _ in range(max_stations - len(entries)):
+        body += _net_station(migration_rank=0xFF, prefix_len=prefix_len)
+    station_array_size = max_stations * station_size
+    return bytes([0x01, NET_CONN_REQUEST]) + station_array_size.to_bytes(2, "big") + body
+
+
+def build_net_property_ack(seqid):
+    """The host retransmits its 0x50 every 500 ms until this ack echoes its seqid."""
+    return bytes([0x01, NET_UPDATE_PROPERTY_ACK, 0x00, 0x00]) + (seqid & 0xFFFFFFFF).to_bytes(4, "big")
+
+
+def parse_net_conn_request(payload):
+    """-> (host_var, host_mac, seqid). The host's constant id is the emulator's fixed virtual
+    adapter MAC, the same on every Switch, not its LDN MAC; the Session join must address it."""
+    n = parse_net(payload)
+    if not n or n[1] != NET_CONN_REQUEST or len(n[2]) < 12:
+        return None
+    body = n[2]
+    return int.from_bytes(body[4:6], "big"), bytes(body[6:12]), int.from_bytes(body[0:4], "big")
+
+
+def parse_rtt(payload):
+    """Byte 0 type (0 request, 1 response), byte 3 protocol version, [8:16] system time, [19:21]
+    subject var id (NintendoClients wiki, RTT-Protocol)."""
+    if len(payload) < 16:
+        return None
+    return {"type": payload[0],
+            "version": payload[3],
+            "systime": payload[8:16],
+            "subject": payload[19:21] if len(payload) >= 21 else b""}
+
+
+def build_rtt_response(request):
+    """The request with byte 0 = 1; the host times its round trip off the echoed timestamp."""
+    b = bytearray(request[:21].ljust(21, b"\x00"))
+    b[0] = 1
+    return bytes(b)
+
+
+def build_rtt_request(template, systime):
+    """The host's last request as a template, type 0, a fresh system time."""
+    b = bytearray(template[:21].ljust(21, b"\x00"))
+    b[0] = 0
+    b[8:16] = (systime & ((1 << 64) - 1)).to_bytes(8, "little")
+    return bytes(b)
+
+
+def build_session_join(src_mac, src_var, src_ip, dst_mac, dst_var, player_name,
+                       random4, *, src_port=12345, app_ver=DEFAULT_APP_VER,
+                       protocols=DEFAULT_PROTOCOLS, player_id=DEFAULT_PLAYER_ID,
+                       token=b"\x00" * 32):
+    """The GBA app's host accepts a zero `token`; a Legends Z-A joiner sends 0x06 then zeroes."""
+    out = bytearray([SESSION_JOIN_REQUEST, len(protocols)])
+    for pid, ver in protocols:
+        out += bytes([pid, ver])
+    out += app_ver
+    out += random4  # nonce
+    out += bytes(src_mac) + b"\x00\x00"
+    out += bytes(src_var)
+    out += bytes([0, 0])  # NAT mapping, is-private-IPv6
+    out += bytes(token).ljust(32, b"\x00")[:32]
+    out += bytes(dst_mac) + b"\x00\x00"
+    out += bytes(dst_var)
+    out += bytes([1, 1])  # players, participants
+    out += bytes([0]) + _ip4(src_ip) + src_port.to_bytes(2, "big")
+    nm = player_name.encode()[:20]
+    out += player_id + len(nm).to_bytes(4, "big") + bytes([1]) + nm
+    return bytes(out)
+
+
+def _constant_id8(value):
+    value = bytes(value)
+    if len(value) == 6:
+        return value + b"\x00\x00"
+    if len(value) != 8:
+        raise ValueError("Pia constant id must be 6 or 8 bytes")
+    return value
+
+
+def _parse_player_info(payload, offset):
+    if offset + 21 > len(payload):
+        raise ValueError("truncated Session PlayerInfo")
+    player_id = bytes(payload[offset:offset + 16])
+    name_size = int.from_bytes(payload[offset + 16:offset + 20], "big")
+    encoding = payload[offset + 20]
+    end = offset + 21 + name_size
+    if name_size > 40 or end > len(payload):
+        raise ValueError("invalid Session PlayerInfo name size")
+    return {
+        "player_id": player_id,
+        "encoding": encoding,
+        "name": bytes(payload[offset + 21:end]),
+    }, end
+
+
+def parse_session_join(payload):
+    """None for a malformed or non-IPv4 request."""
+    payload = bytes(payload)
+    try:
+        if len(payload) < 2 or payload[0] != SESSION_JOIN_REQUEST:
+            return None
+        nprotocols = payload[1]
+        pos = 2
+        if pos + nprotocols * 2 + 2 + 4 + 8 + 2 + 2 + 32 + 8 + 2 + 2 > len(payload):
+            return None
+        protocols = [(payload[pos + i * 2], payload[pos + i * 2 + 1])
+                     for i in range(nprotocols)]
+        pos += nprotocols * 2
+        app_ver = bytes(payload[pos:pos + 2]); pos += 2
+        random4 = bytes(payload[pos:pos + 4]); pos += 4
+        source_constant_id = bytes(payload[pos:pos + 8]); pos += 8
+        source_var = int.from_bytes(payload[pos:pos + 2], "big"); pos += 2
+        nat_mapping, private_ipv6 = payload[pos], payload[pos + 1]; pos += 2
+        token = bytes(payload[pos:pos + 32]); pos += 32
+        destination_constant_id = bytes(payload[pos:pos + 8]); pos += 8
+        destination_var = int.from_bytes(payload[pos:pos + 2], "big"); pos += 2
+        num_players, num_participants = payload[pos], payload[pos + 1]; pos += 2
+        if pos >= len(payload) or payload[pos] != 0:
+            return None
+        pos += 1
+        if pos + 6 > len(payload):
+            return None
+        ip = ".".join(str(x) for x in payload[pos:pos + 4]); pos += 4
+        port = int.from_bytes(payload[pos:pos + 2], "big"); pos += 2
+        players = []
+        for _ in range(num_players):
+            player, pos = _parse_player_info(payload, pos)
+            players.append(player)
+        if pos != len(payload):
+            return None
+        return {
+            "protocols": protocols,
+            "app_ver": app_ver,
+            "random4": random4,
+            "source_constant_id": source_constant_id,
+            "source_var": source_var,
+            "nat_mapping": nat_mapping,
+            "private_ipv6": private_ipv6,
+            "identification_token": token,
+            "destination_constant_id": destination_constant_id,
+            "destination_var": destination_var,
+            "num_players": num_players,
+            "num_participants": num_participants,
+            "ip": ip,
+            "port": port,
+            "players": players,
+        }
+    except (IndexError, ValueError):
+        return None
+
+
+def _build_player_info(player_id, name, encoding=1):
+    player_id = bytes(player_id)
+    if len(player_id) != 16:
+        raise ValueError("Pia player id must be 16 bytes")
+    name = name.encode() if isinstance(name, str) else bytes(name)
+    if len(name) > 40:
+        raise ValueError("Pia player name is too long")
+    return player_id + len(name).to_bytes(4, "big") + bytes([encoding]) + name
+
+
+def _build_session_station(constant_id, variable_id, ip, port, station_index,
+                           join_order, token, num_players, num_participants, players):
+    token = bytes(token)
+    if len(token) != 32:
+        raise ValueError("Pia identification token must be 32 bytes")
+    out = bytearray(_constant_id8(constant_id))
+    out += (_vid(variable_id) & 0xFFFF).to_bytes(2, "big")
+    out += _ip4(ip) + (port & 0xFFFF).to_bytes(2, "big")
+    out += bytes([station_index & 0xFF])
+    out += (join_order & 0xFFFF).to_bytes(2, "big")
+    out += b"\x00\x00"  # left-join order / reserved
+    out += token
+    out += bytes([num_players & 0xFF, num_participants & 0xFF])
+    out += b"\x00\x00"
+    for player in players:
+        out += _build_player_info(player["player_id"], player["name"], player["encoding"])
+    return bytes(out)
+
+
+def build_session_update(join, host_constant_id, host_var, host_ip, host_name,
+                         *, host_player_id=DEFAULT_PLAYER_ID, sequence_id=1,
+                         host_token=b"\x00" * 32, update_sequence=0):
+    """The leader's Session type-5 update, Pia 6.39: a one-fragment 7-byte header, leader first."""
+    if not join or not join.get("players"):
+        raise ValueError("a parsed Session join with at least one player is required")
+    host_constant_id = _constant_id8(host_constant_id)
+    host_var = _vid(host_var)
+    host_player = {"player_id": bytes(host_player_id), "name": host_name, "encoding": 1}
+    host_station = _build_session_station(
+        host_constant_id, host_var, host_ip, 12345, 0, 0, bytes(host_token).ljust(32, b"\x00"),
+        1, 1, [host_player])
+    guest_station = _build_session_station(
+        join["source_constant_id"], join["source_var"], join["ip"], join["port"], 1, 1,
+        join["identification_token"], join["num_players"], join["num_participants"],
+        join["players"])
+    # [type, sequence:u16, fragment count, fragment index, offset:u16]. The sequence rides at +1 and
+    # +21: a Legends Z-A host's second update differs from its first there alone (docs/za.md,
+    # Hosting).
+    out = bytearray.fromhex("05000001000003")
+    out[1:3] = (update_sequence & 0xFFFF).to_bytes(2, "big")
+    out += host_constant_id
+    out += host_var.to_bytes(2, "big")
+    out += bytes([2, 0])  # two stations, no departed stations
+    out += (sequence_id & 0xFFFF).to_bytes(2, "big")
+    out += (update_sequence & 0xFFFF).to_bytes(2, "big")
+    out += b"\x00" * 4  # 6.39 reserved
+    out += host_station + guest_station
+    return bytes(out)
+
+
+def build_session_join_response(join, host_constant_id, host_var, random4):
+    random4 = bytes(random4)
+    if len(random4) != 4:
+        raise ValueError("Session join response random value must be four bytes")
+    versions = dict(join["protocols"])
+    session_version = versions.get(PROTO_SESSION, 7)
+    return (bytes([SESSION_JOIN_RESPONSE, PROTO_SESSION, session_version, 1])
+            + b"\x00" * 4 + random4
+            + _constant_id8(host_constant_id) + (_vid(host_var) & 0xFFFF).to_bytes(2, "big")
+            + _constant_id8(join["source_constant_id"])
+            + (join["source_var"] & 0xFFFF).to_bytes(2, "big")
+            + bytes([1]) + (1).to_bytes(2, "big") + b"\x00\x00")
+
+
+# Pia 6.16-6.30 (version 11) Session layouts (docs/pla.md, The Session join reply).
+SESSION_JOIN_ACK = 1
+WIRE_SESSION_PROTOCOL = 0x98
+
+
+def _location_id(constant_id, variable_id):
+    return _constant_id8(constant_id) + b"\x00\x00" + (_vid(variable_id) & 0xFFFF).to_bytes(2, "big")
+
+
+def parse_session_join_v11(payload, *, header_end=None):
+    """A version-11 Session type-0 join request (`0x7364e4`), or None when malformed."""
+    payload = bytes(payload)
+    try:
+        if len(payload) < 2 or payload[0] != SESSION_JOIN_REQUEST:
+            return None
+        nprotocols = payload[1]
+        p = 2 + nprotocols * 2
+        protocols = [(payload[2 + i * 2], payload[2 + i * 2 + 1]) for i in range(nprotocols)]
+        if header_end is not None:
+            p = header_end
+        if p + 4 + 12 + 32 + 3 + 6 + 12 > len(payload):
+            return None
+        app4 = bytes(payload[p:p + 4])
+        source_constant_id = bytes(payload[p + 4:p + 12])
+        source_var = int.from_bytes(payload[p + 14:p + 16], "big")
+        token = bytes(payload[p + 16:p + 48])
+        ip = ".".join(str(x) for x in payload[p + 51:p + 55])
+        port = int.from_bytes(payload[p + 55:p + 57], "big")
+        destination_constant_id = bytes(payload[p + 57:p + 65])
+        destination_var = int.from_bytes(payload[p + 67:p + 69], "big")
+        return {
+            "protocols": protocols,
+            "app4": app4,
+            "source_constant_id": source_constant_id,
+            "source_var": source_var,
+            "identification_token": token,
+            "ip": ip,
+            "port": port,
+            "destination_constant_id": destination_constant_id,
+            "destination_var": destination_var,
+        }
+    except (IndexError, ValueError):
+        return None
+
+
+def build_session_join_ack_v11(host_constant_id, host_var, console_constant_id, console_var):
+    """Session type-1 join ack, 25 bytes (`0x737534`, docs/pla.md)."""
+    return (bytes([SESSION_JOIN_ACK])
+            + _location_id(host_constant_id, host_var)
+            + _location_id(console_constant_id, console_var))
+
+
+def build_session_join_response_v11(host_constant_id, host_var, console_constant_id, console_var,
+                                    *, version=0, status=1, route=(0, 1), station_index=1,
+                                    join_order=1, sequence_id=1, random4=b"\x00" * 4):
+    """Session type-2 join response (`0x7379c0`, docs/pla.md). `route=None` gives the 41-byte form
+    a Scarlet host sends (docs/sv.md); with a route it is Arceus's 43 bytes."""
+    random4 = bytes(random4)
+    if len(random4) != 4:
+        raise ValueError("Session join response random value must be four bytes")
+    assignment = bytes() if route is None else bytes([route[0] & 0xFF, route[1] & 0xFF])
+    return (bytes([SESSION_JOIN_RESPONSE, WIRE_SESSION_PROTOCOL, version & 0xFF, status & 0xFF])
+            + b"\x00" * 4 + random4
+            + _location_id(host_constant_id, host_var)
+            + _location_id(console_constant_id, console_var)
+            + assignment + bytes([station_index & 0xFF])
+            + (join_order & 0xFFFF).to_bytes(2, "big")
+            + (sequence_id & 0xFFFF).to_bytes(2, "big"))
+
+
+def _session_station_v11(constant_id, variable_id, ip, port, *, station_index, route,
+                         join_order, token, players, participants=None, nat=0, private_ipv6=0):
+    """One IPv4 station of a version-11 type-5 list (`0x739050`, docs/pla.md). `route=None` gives
+    Scarlet's 79-byte station, with a route Arceus's 81. The caller clears its IPv6 bitmap bit."""
+    token = bytes(token)
+    if len(token) != 32:
+        raise ValueError("Pia identification token must be 32 bytes")
+    out = bytearray(_constant_id8(constant_id))
+    out += (_vid(variable_id) & 0xFFFF).to_bytes(4, "big")       # [0000 | var]
+    out += _ip4(ip) + (port & 0xFFFF).to_bytes(2, "big")
+    if route is not None:
+        out += bytes([route[0] & 0xFF, route[1] & 0xFF])
+    out += bytes([station_index & 0xFF])
+    out += (join_order & 0xFFFF).to_bytes(2, "big")
+    out += bytes([nat & 0xFF, 1 if private_ipv6 else 0])
+    out += token
+    out += bytes([len(players) & 0xFF,
+                  (len(players) if participants is None else participants) & 0xFF])
+    for player in players:
+        out += _build_player_info(player["player_id"], player["name"], player.get("encoding", 1))
+    return bytes(out)
+
+
+SESSION_LEAVE_REQUEST = 3
+
+
+def build_session_leave_v11(constant_id, variable_id, ip, port=12345, *, reason=0,
+                            random4=b"\0\0\0\0"):
+    """Session type-3 leave request, 24 bytes (docs/pla.md, Leaving). A session of two owes no
+    type-7 left-station sync. Nothing reads the random word back."""
+    return (bytes([SESSION_LEAVE_REQUEST])
+            + bytes(random4)[:4].ljust(4, b"\0")
+            + _location_id(constant_id, variable_id)
+            + bytes([reason & 0xFF])
+            + _ip4(ip) + (port & 0xFFFF).to_bytes(2, "big"))
+
+
+def build_session_update_v11(host_constant_id, host_var, stations, *, sequence_id=1):
+    """Session type-5 station-list update, 6.16-6.30 band, one fragment at offset 3 (`0x738740`,
+    docs/pla.md, The type-5 station-list update)."""
+    count = len(stations)
+    payload = bytearray(_constant_id8(host_constant_id))
+    payload += (_vid(host_var) & 0xFFFF).to_bytes(4, "big")      # [0000 | var]
+    payload += bytes([count & 0xFF])
+    payload += bytearray((count + 31) // 32 * 4)  # IPv6 bitmap, all clear
+    for st in stations:
+        payload += _session_station_v11(
+            st["constant_id"], st["variable_id"], st["ip"], st["port"],
+            station_index=st["station_index"], route=st.get("route", (0, 0)),
+            join_order=st.get("join_order", 0), token=st.get("token", b"\x00" * 32),
+            players=st.get("players", []), participants=st.get("participants"))
+    fragment_header = (bytes([SESSION_UPDATE]) + (sequence_id & 0xFFFF).to_bytes(2, "big")
+                       + bytes([1, 0]) + (3).to_bytes(2, "big"))  # count 1, index 0, offset 3
+    return fragment_header + bytes(payload)
+
+
+# The joiner's side, from Scarlet's writers and parsers (docs/sv.md, The Session join request).
+JOIN_RESPONSE_STATUS = {1: "accepted", 3: "protocol version mismatch", 4: "denied by the host",
+                        5: "session not accepting"}
+
+
+def parse_session_join_response_v11(payload):
+    """Session type 2 as the host `0x6d6390` writes it (docs/pla.md, docs/sv.md). On status 3, +1
+    and +2 are the offending protocol id and the host's version of it."""
+    payload = bytes(payload)
+    if len(payload) < 41 or payload[0] != SESSION_JOIN_RESPONSE:
+        return None
+    # Scarlet's is 41 bytes with no route bytes: index at +0x24, join order +0x25, sequence +0x27
+    # (`0x6d7460`).
+    routed = len(payload) >= 43
+    p = 38 if routed else 36
+    return {
+        "protocol": payload[1],
+        "version": payload[2],
+        "status": payload[3],
+        "status_name": JOIN_RESPONSE_STATUS.get(payload[3], "?"),
+        "value": int.from_bytes(payload[4:8], "big"),
+        "random": bytes(payload[8:12]),
+        "host_constant_id": bytes(payload[12:20]),
+        "host_var": int.from_bytes(payload[22:24], "big"),
+        "console_constant_id": bytes(payload[24:32]),
+        "console_var": int.from_bytes(payload[34:36], "big"),
+        "route": (payload[36], payload[37]) if routed else None,
+        "station_index": payload[p],
+        "join_order": int.from_bytes(payload[p + 1:p + 3], "big"),
+        "sequence_id": int.from_bytes(payload[p + 3:p + 5], "big"),
+    }
+
+
+def parse_session_update_v11(payload, *, route_bytes=2):
+    """The reverse of `build_session_update_v11`; a partial fragment returns its header only.
+    Scarlet's entries carry no route bytes (`route_bytes=0`)."""
+    payload = bytes(payload)
+    if len(payload) < 7 or payload[0] != SESSION_UPDATE:
+        return None
+    out = {
+        "sequence_id": int.from_bytes(payload[1:3], "big"),
+        "fragment_count": payload[3],
+        "fragment_index": payload[4],
+        "offset": int.from_bytes(payload[5:7], "big"),
+        "stations": [],
+    }
+    if out["fragment_count"] != 1 or out["offset"] != 3:
+        return out
+    body = payload[7:]
+    try:
+        out["host_constant_id"] = bytes(body[0:8])
+        out["host_var"] = int.from_bytes(body[10:12], "big")
+        count = body[12]
+        bitmap = body[13:13 + (count + 31) // 32 * 4]
+        p = 13 + len(bitmap)
+        for i in range(count):
+            ipv6 = bool(int.from_bytes(bitmap[i // 32 * 4:i // 32 * 4 + 4], "little") >> (i % 32) & 1)
+            st = {"constant_id": bytes(body[p:p + 8]),
+                  "variable_id": int.from_bytes(body[p + 10:p + 12], "big")}
+            p += 12
+            if ipv6:
+                st["ip"], st["port"] = bytes(body[p:p + 16]).hex(), int.from_bytes(body[p + 16:p + 18], "big")
+                p += 18
+            else:
+                st["ip"] = ".".join(str(x) for x in body[p:p + 4])
+                st["port"] = int.from_bytes(body[p + 4:p + 6], "big")
+                p += 6
+            st["route"] = (body[p], body[p + 1]) if route_bytes == 2 else None
+            p += route_bytes
+            st["station_index"] = body[p]
+            st["join_order"] = int.from_bytes(body[p + 1:p + 3], "big")
+            st["nat"], st["private_ipv6"] = body[p + 3], body[p + 4]
+            st["token"] = bytes(body[p + 5:p + 37])
+            nplayers, st["participants"] = body[p + 37], body[p + 38]
+            p += 39
+            st["players"] = []
+            for _ in range(nplayers):
+                player, p = _parse_player_info(body, p)
+                st["players"].append(player)
+            out["stations"].append(st)
+    except (IndexError, ValueError):
+        out["truncated"] = True
+    return out
+
+
+SESSION_START_HOST_MIGRATION_ACK = 8
+
+
+def parse_session_migration_v11(payload):
+    """Session type 7 (`LeaveMeshWithHostMigrationJob`, 0x6d8de0), the host naming its successor.
+    34 bytes: type, host location id, a byte, host IPv4 and port, target location id, 00 00."""
+    payload = bytes(payload)
+    if len(payload) < 32 or payload[0] != 7:
+        return None
+    return {
+        "host_constant_id": bytes(payload[1:9]),
+        "host_var": int.from_bytes(payload[11:13], "big"),
+        "host_ip": ".".join(str(x) for x in payload[14:18]),
+        "host_port": int.from_bytes(payload[18:20], "big"),
+        "target_constant_id": bytes(payload[20:28]),
+        "target_var": int.from_bytes(payload[30:32], "big"),
+    }
+
+
+def build_session_migration_ack_v11(self_constant_id, self_var, host_constant_id, host_var):
+    """Session type 8, 25 bytes (writer 0x6d917c): the self location id, then the host's."""
+    return (bytes([SESSION_START_HOST_MIGRATION_ACK])
+            + _location_id(self_constant_id, self_var)
+            + _location_id(host_constant_id, host_var))
+
+
+def build_session_update_ack_v11(console_constant_id, sequence_id):
+    """Session type 6, 13 bytes (Scarlet `0x6d80a4`, Arceus `0x738740`): type, own constant id,
+    00 00, the sequence applied."""
+    return (bytes([SESSION_UPDATE_ACK]) + _constant_id8(console_constant_id) + b"\x00\x00"
+            + (sequence_id & 0xFFFF).to_bytes(2, "big"))
+
+
+def parse_session(payload):
+    if not payload:
+        return None
+    t = payload[0]
+    rec = {"type": t}
+    if t in (SESSION_JOIN_REQUEST, SESSION_UPDATE) and len(payload) > 2:
+        rec["count"] = payload[1]
+    return rec
+
+
+# A stage advances only on the host's retransmitted message, so a lost send is repeated. Header
+# (dst, src): Net 0x12 (0, 0), Session join (0, our_var), finalize and reliable (host_var, our_var).
+ST_NET, ST_FINALIZE, ST_CONNECTED = "net", "finalize", "connected"
+NET_WAIT, SESSION_WAIT, CONNECTED = ST_NET, ST_FINALIZE, ST_CONNECTED
+
+
+def build_session_finalize(our_mac):
+    """Session type 6 `06 <our_mac:6> 0000 0000000000 01`, carrying the joiner's own constant id."""
+    return bytes([6]) + bytes(our_mac) + b"\x00\x00" + b"\x00" * 5 + bytes([1])
+
+
+def _vid(x):
+    return x if isinstance(x, int) else int.from_bytes(x, "big")
+
+
+class ConnectionManager:
+    def __init__(self, our_mac, host_mac, our_ip, host_ip, our_var=0xc493,
+                 player_name="EMU", random4=b"\x00\x00\x00\x00", log=lambda *a: None,
+                 player_id=None, rtt_before_finalize=False, join_repeat_ticks=0):
+        self.player_id = bytes(player_id) if player_id else DEFAULT_PLAYER_ID
+        self.rtt_before_finalize = bool(rtt_before_finalize)
+        self.join_repeat_ticks = int(join_repeat_ticks or 0)
+        self._join_sent_tick = None
+        self.our_mac = bytes(our_mac)
+        self.host_mac = bytes(host_mac)
+        self.our_ip = our_ip
+        self.host_ip = host_ip
+        self.our_var = _vid(our_var)
+        self.host_var = None
+        self.player_name = player_name
+        self.random4 = random4
+        self.log = log
+        self.info = getattr(log, "info", log)
+        self.state = ST_NET
+        self._outbox = []
+        self._last_host_rtt = None
+        self._rtt_systime = 0x10000
+        self._rtt_orig_tick = -10 ** 9
+        self._rtt_pending = {}
+        self.rtt_samples = []
+
+    def maybe_originate_rtt(self, tick):
+        """A type-0 RTT probe every RTT_ORIGINATE_PERIOD VBlanks once connected; the host expects
+        them. Waits for a host request to copy the layout from."""
+        if not self.connected or self._last_host_rtt is None or self.host_var is None:
+            return
+        if tick - self._rtt_orig_tick < RTT_ORIGINATE_PERIOD:
+            return
+        self._rtt_orig_tick = tick
+        self._rtt_systime = (self._rtt_systime + 1) & ((1 << 64) - 1)
+        self._rtt_pending[self._rtt_systime] = tick
+        if len(self._rtt_pending) > 64:
+            for k in sorted(self._rtt_pending, key=self._rtt_pending.get)[:32]:
+                del self._rtt_pending[k]
+        self._q(PROTO_RTT, build_rtt_request(self._last_host_rtt, self._rtt_systime),
+                SESSION_VAR, self.our_var, False, True, False, footer_var=self.host_var)
+
+    @property
+    def connected(self):
+        return self.state == ST_CONNECTED
+
+    def learn_ids(self, our_var, host_var):
+        if our_var is not None:
+            self.our_var = _vid(our_var)
+        if host_var is not None:
+            self.host_var = _vid(host_var)
+
+    def _join(self):
+        return build_session_join(self.our_mac, self.our_var.to_bytes(2, "big"), self.our_ip,
+                                  self.host_mac, (self.host_var or 0).to_bytes(2, "big"),
+                                  self.player_name, self.random4, player_id=self.player_id)
+
+    def maybe_repeat_join(self, tick):
+        if (not self.join_repeat_ticks or self.state != ST_NET or self.host_var is None
+                or self._join_sent_tick is None):
+            return
+        if tick - self._join_sent_tick < self.join_repeat_ticks:
+            return
+        self._join_sent_tick = tick
+        self._q(PROTO_SESSION, self._join(), 0, self.our_var, True, False, True, pktid=0)
+        self.log("[pia] re-sent the Session join (join_repeat_ticks)")
+
+    def _q(self, proto, payload, dst, src, compress, footer, establishing, pktid=None, footer_var=None):
+        """Establishing frames force `pktid` 0; RTT sets `footer_var` to the host var."""
+        self._outbox.append({"proto": proto, "payload": payload, "dst": dst, "src": src,
+                             "compress": compress, "footer": footer, "establishing": establishing,
+                             "unicast": True, "pktid": pktid, "footer_var": footer_var})
+
+    def on_message(self, proto, payload, tick=None):
+        if proto == PROTO_NET:
+            n = parse_net(payload)
+            if n and n[1] == NET_CONN_REQUEST and self.state == ST_NET:
+                req = parse_net_conn_request(payload)
+                seqid = 2
+                if req:
+                    host_var, host_mac, seqid = req
+                    self.host_mac = host_mac
+                    if self.host_var is None:
+                        self.host_var = host_var
+                self._q(PROTO_NET, build_net_response(seqid), 0, 0, False, False, True, pktid=0)
+                if self.host_var is not None:
+                    self._q(PROTO_SESSION, self._join(), 0, self.our_var, True, False, True, pktid=0)
+                    if self._join_sent_tick is None and tick is not None:
+                        self._join_sent_tick = tick
+            elif n and n[1] == NET_UPDATE_PROPERTY:
+                body = n[2]
+                seqid = int.from_bytes(body[0:4], "big") if len(body) >= 4 else 1
+                self._q(PROTO_NET, build_net_property_ack(seqid), 0, self.our_var, False, False, True)
+        elif proto == PROTO_SESSION:
+            # Finalize on the type-5 accept only: native sends exactly one.
+            s = parse_session(payload)
+            if (s and s["type"] == SESSION_UPDATE
+                    and self.host_var is not None and self.state != ST_CONNECTED):
+                self._q(PROTO_SESSION, build_session_finalize(self.our_mac),
+                        self.host_var, self.our_var, False, True, False)
+            if self.state == ST_NET:
+                self.state = ST_FINALIZE
+                self.log("host acked join (Session) -> FINALIZE")
+                self.info("Host acknowledged our join.")
+        elif proto in (PROTO_RTT, PROTO_RELIABLE):
+            if self.state == ST_FINALIZE:
+                self.state = ST_CONNECTED
+                self.log("host live (RTT/Reliable) -> CONNECTED")
+                self.info("Connection established.")
+            # Native does not answer RTT before finalize.
+            if proto == PROTO_RTT and (self.state != ST_NET or self.rtt_before_finalize) \
+                    and self.host_var is not None:
+                r = parse_rtt(payload)
+                if r and r["type"] == 0:
+                    self._last_host_rtt = bytes(payload[:21])
+                    self._q(PROTO_RTT, build_rtt_response(payload),
+                            SESSION_VAR, self.our_var, False, True, False, footer_var=self.host_var)
+                elif r and r["type"] == 1 and tick is not None:
+                    systime = int.from_bytes(r["systime"], "little")
+                    sent = self._rtt_pending.pop(systime, None)
+                    if sent is not None and tick >= sent:
+                        self.rtt_samples.append(tick - sent)
+
+    def drain(self):
+        out, self._outbox = self._outbox, []
+        return out

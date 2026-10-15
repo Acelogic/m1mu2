@@ -1,0 +1,254 @@
+"""Pia's Mesh Protocol (0x18); BDSP advertises version 3 (Pia 5.30-5.45), so the 5.31-5.45
+structures apply."""
+
+import struct
+
+import pytest
+
+from pokeldn.ldn import mesh_protocol as mp, station_protocol as stp
+
+
+def test_a_join_request_is_six_bytes_and_calls_itself_253():
+    req = mp.build_join_request(7)
+    assert req == bytes([mp.JOIN_REQUEST, 253]) + struct.pack(">I", 7)
+    assert len(req) == 6
+    assert mp.STATION_INDEX_INVALID == 253       # "has not joined a mesh yet"
+    assert mp.parse_message(req) == (mp.JOIN_REQUEST, "JOIN_REQUEST")
+
+
+def test_a_refusal_is_told_from_a_success_by_its_two_ff_bytes():
+    out = mp.parse_join_response(bytes([mp.JOIN_RESPONSE, 0, 0xFF, 0xFF, 9]))
+    assert out == {"refused": True, "reason": 9}
+
+
+def _success(entries=2, our_index=1, fragments=1):
+    head = bytes([mp.JOIN_RESPONSE, entries, 0, our_index, fragments, 0, entries, 0,
+                  8, 0, 8, 0]) + struct.pack(">I", 42)
+    body = b""
+    for i in range(entries):
+        loc = stp.station_location(f"169.254.14.{i + 1}", 12345, 0x1122334455667788 + i,
+                                   0xAABB0000 + i, 0xCCDD0000 + i)
+        body += loc.ljust(mp.LOCATION_FIELD, b"\0") + bytes([i]) + b"\0" * 3
+    return head + body + struct.pack(">I", 0x17CAD56C)
+
+
+def test_a_truncated_entry_stops_the_walk_rather_than_reading_past_the_end():
+    raw = _success(entries=2)
+    out = mp.parse_join_response(raw[:-40])
+    assert len(out["station_info"]) < 2
+
+
+def test_the_wrong_message_type_is_refused():
+    with pytest.raises(ValueError):
+        mp.parse_join_response(bytes([mp.UPDATE_MESH, 0, 0, 0, 0]))
+    with pytest.raises(ValueError):
+        mp.parse_message(b"")
+
+
+# The join response off a console capture; eleven identical copies arrived 500 ms apart,
+# unacknowledged.
+SP35_JOIN_RESPONSE = bytes.fromhex(
+    "0202000101000200080008000000000002060000a9fe0e013039000000000000eb9b2220f148"
+    "0000002a1f29597bc2a30000000100000000000000000000000000000000000000000000000000"
+    "000000000000000606a9fe0e023039a9fe0e0230390000000000001249a221d85800002b7f4c11"
+    "32669aea050100010000000000000000000000000000000000000000000000000100010017cad56f")
+
+
+def test_the_ack_id_is_the_last_four_bytes_big_endian():
+    assert mp.read_ack_id(SP35_JOIN_RESPONSE) == 0x17CAD56F
+    assert mp.read_ack_id(mp.build_join_request(7)) == 7      # the last four of six
+    assert mp.read_ack_id(b"\x02\x00\x00") == 0          # 0x01542db8's borrow check answers 0
+
+
+def test_a_mesh_message_is_acked_on_the_station_protocol_not_the_mesh_one():
+    proto, payload = mp.ack_for(SP35_JOIN_RESPONSE)
+    assert proto == stp.PROTOCOL == 0x14                 # NOT mp.PROTOCOL
+    assert payload == bytes.fromhex("050000_0017cad56f".replace("_", ""))
+    assert payload == stp.build_ack(0x17CAD56F)
+    assert len(payload) == 8                             # main.bin 0x01550324 sends w3 = 8
+
+
+def test_only_the_two_acked_types_produce_an_ack():
+    assert mp.ack_for(mp.build_join_request(3))[0] == stp.PROTOCOL
+    assert mp.ack_for(bytes([mp.UPDATE_MESH, 0, 0, 0, 0])) is None
+    assert mp.ack_for(bytes([mp.DUMMY_ACK, 0, 0, 0])) is None
+    assert mp.ack_for(b"") is None
+
+
+def test_the_real_join_response_reads_back_as_the_mesh_the_console_named():
+    out = mp.parse_join_response(SP35_JOIN_RESPONSE)
+    assert out["stations"] == 2 and out["host_index"] == 0 and out["our_index"] == 1
+    assert out["fragments"] == 1 and out["entries"] == 2 and out["update_counter"] == 0
+    assert (out["max_active"], out["max_buffer"], out["max_total"]) == (8, 0, 8)
+    assert out["ack_id"] == 0x17CAD56F
+    host, us = out["station_info"]
+    assert host["station_index"] == 0 and host["join_order"] == 0
+    assert us["station_index"] == 1 and us["join_order"] == 1
+    assert host["location"]["private"] == ("169.254.14.1", 12345)
+    assert host["location"]["constant_id"] == 0xEB9B2220F1480000
+    assert us["location"]["private"] == ("169.254.14.2", 12345)
+    assert us["location"]["variable_id"] == 0x2B7F4C11
+
+
+# One real UPDATE_MESH off the console, sent about once a second at the full 556 bytes.
+SP45_UPDATE_MESH = bytes.fromhex(
+    "20020000000000050100020002060000a9fe07013039000000000000eb9b2220f1480000406a4ae6597bc2a30000000100000000000000000000000000000000000000000000000000000000000000000606a9fe07023039a9fe070230390000000000001249a221d85800002b7f4c1a32669aea0501000100000000000000000000000000000000000000000000000001000300000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000")
+
+
+def test_the_update_mesh_is_always_the_full_eight_seats():
+    assert len(SP45_UPDATE_MESH) == mp.UPDATE_MESH_SIZE == 556
+    assert mp.UPDATE_MESH_SIZE == 12 + 8 * mp.STATION_INFO_SIZE
+    out = mp.parse_update_mesh(SP45_UPDATE_MESH)
+    assert out["stations"] == 2 and out["host_index"] == 0
+    assert out["update_counter"] == 5
+    assert out["fragments"] == 1 and out["fragment_index"] == 0
+    assert out["entries"] == 2 and out["base_index"] == 0
+    assert len(out["station_info"]) == 2          # entries, not the length, says how many
+    host, us = out["station_info"]
+    assert host["station_index"] == 0 and host["join_order"] == 0
+    # Join order counts joins: two seats taken in one room session.
+    assert us["station_index"] == 1 and us["join_order"] == 3
+    assert host["location"]["private"][1] == 12345
+    assert us["location"]["variable_id"] == 0x2B7F4C1A     # the --src-var the capture ran with
+
+
+def test_a_wrong_type_is_refused():
+    with pytest.raises(ValueError):
+        mp.parse_update_mesh(bytes([mp.JOIN_RESPONSE]) + bytes(20))
+
+
+# Sword/Shield version 4 fixtures are synthetic.
+
+def _success_v4(stations=2, our_index=1, fragments=1, fragment_entries=None, base=0):
+    """A version-4 join response: the same 16-byte header, 64-byte entries, index at 0x3E."""
+    count = stations if fragments == 1 else fragment_entries
+    head = bytes([mp.JOIN_RESPONSE, stations, 0, our_index, fragments, 0,
+                  fragment_entries or 0, base, 8, 0, 8, 0]) + struct.pack(">I", 42)
+    body = b""
+    for i in range(count):
+        loc = stp.station_location(f"169.254.14.{i + 1}", 12345, 0x1122334455667788 + i,
+                                   0xAABB0000 + i, 0xCCDD0000 + i)
+        entry = bytearray(mp.STATION_INFO_SIZE_V4)
+        entry[:len(loc)] = loc
+        entry[mp.INDEX_FIELD_V4] = base + i
+        body += bytes(entry)
+    return head + body + struct.pack(">I", 0x17CAD56C)
+
+
+def test_an_unfragmented_version_four_response_counts_by_stations_not_by_field_six():
+    # 0x017b48f4 walks `stations` from base 0 and never reads [6] or [7].
+    raw = bytearray(_success_v4(stations=2))
+    raw[6] = raw[7] = 0
+    out = mp.parse_join_response(bytes(raw), version4=True)
+    assert out["entry_count"] == 2 and out["entry_base"] == 0
+    assert len(out["station_info"]) == 2
+    assert len(mp.parse_join_response(bytes(raw))["station_info"]) == 0    # 5.31-5.45 reads [6]
+
+
+def test_a_fragmented_version_four_response_counts_by_field_six_into_slot_seven():
+    out = mp.parse_join_response(_success_v4(stations=5, fragments=2, fragment_entries=2, base=3),
+                                 version4=True)
+    assert out["entry_count"] == 2 and out["entry_base"] == 3
+    assert [e["station_index"] for e in out["station_info"]] == [3, 4]
+
+
+def test_the_version_four_message_table_is_the_same_one_without_the_two_dummies():
+    assert len(mp.MESH_TYPES_V4) == 19                     # the jump table's live entries
+    assert mp.DUMMY_MESSAGE not in mp.MESH_TYPES_V4
+    assert mp.DUMMY_ACK not in mp.MESH_TYPES_V4
+    named = {v for v, k in mp.TYPE_NAMES.items() if not k.startswith(("PROTOCOL", "PORT_"))}
+    assert mp.MESH_TYPES_V4 == named - {mp.DUMMY_MESSAGE, mp.DUMMY_ACK}
+
+
+def test_the_real_version_four_join_response_reads_back_as_the_mesh_the_console_named():
+    """Off the console, byte for byte: two stations, us at index 1."""
+    raw = bytes.fromhex(
+        "0202000101000200020008000000000002060000a9fe5f013039000000000000"
+        "eb9b2220f148000069a75e26597bc2a300000001000000000000000000000000"
+        "000000000000000000000000000000000606a9fe5f023039a9fe5f0230390000"
+        "000000001249a221d858000050af6c5a32669aea050100010000000000000000"
+        "000000000000000000000000000001003e3b1c08")
+    assert len(raw) == mp.JOIN_RESPONSE_TWO_STATIONS_V4
+    out = mp.parse_join_response(raw, version4=True)
+    assert out["refused"] is False
+    assert (out["stations"], out["host_index"], out["our_index"]) == (2, 0, 1)
+    assert out["fragments"] == 1 and out["update_counter"] == 0
+    assert out["ack_id"] == 0x3E3B1C08
+    assert [e["station_index"] for e in out["station_info"]] == [0, 1]
+    assert out["station_info"][0]["location"]["private"] == ("169.254.95.1", 12345)
+    assert out["station_info"][1]["location"]["private"] == ("169.254.95.2", 12345)
+    assert out["station_info"][0]["location"]["constant_id"] == 0xEB9B2220F1480000
+    assert mp.ack_for(raw) == (stp.PROTOCOL, bytes.fromhex("050000003e3b1c08"))
+
+
+SW83_MIGRATION_START = bytes.fromhex("440001")     # host 0 names station 1 - us - as the next host
+
+
+def test_the_console_names_us_the_next_host():
+    got = mp.parse_migration_start(SW83_MIGRATION_START)
+    # A run's join response: stations=2 host_index=0 our_index=1.
+    assert got == {"host_index": 0, "new_host_index": 1}
+
+
+def test_the_answer_is_two_bytes_and_carries_our_own_index():
+    # The handler at main.bin 0x017c10ac refuses anything but size 2; the builder at 0x017c3310
+    # writes [0x48, own station index], the index read at mesh+0xAC rather than the host's at 0xAB.
+    assert mp.build_migration_response(1) == bytes.fromhex("4801")
+    assert len(mp.build_migration_response(0)) == mp.MIGRATION_RESPONSE_SIZE
+
+
+def test_the_bound_both_handlers_check_is_thirty_two_stations():
+    assert mp.build_migration_response(mp.MAX_STATION_INDEX)[1] == 0x1F
+    with pytest.raises(ValueError):
+        mp.build_migration_response(mp.MAX_STATION_INDEX + 1)
+
+
+@pytest.mark.parametrize("payload", [
+    b"", b"\x44", bytes.fromhex("4400"), bytes.fromhex("44000102"), bytes.fromhex("410001"),
+])
+def test_a_reader_on_a_live_run_returns_none_rather_than_raising(payload):
+    # Every length the wire can carry comes back None, never an exception.
+    assert mp.parse_migration_start(payload) is None
+
+
+def test_migration_finish_is_the_hosts_own_three_bytes():
+    # 0x017c2ef0 builds [0x41, own index, flag & 1]; the handler at 0x017c0fb0 checks size == 3.
+    assert mp.parse_migration_finish(bytes.fromhex("410001")) == {"host_index": 0, "flag": 1}
+    assert mp.parse_migration_finish(bytes.fromhex("4801")) is None
+
+
+SW83_MIGRATION_WIRE = bytes.fromhex("0f0000030001000100" "440001")
+
+
+def test_the_twelve_bytes_off_the_wire_decode_to_the_answer():
+    """Version-4 reliable header (flags 0x0f, stream 0, size 3, sequence 1), the mesh message and
+    the response, from a capture."""
+    from pokeldn.ldn import reliable4
+
+    got = reliable4.parse_message(SW83_MIGRATION_WIRE)
+    assert got["flags"] & reliable4.FLAG_APPLICATION_DATA
+    assert got["payload_size"] == 3 and got["sequence_id"] == 1
+    assert got["destination_count"] == 0 and not got["truncated"]
+
+    start = mp.parse_migration_start(got["payload"])
+    assert start == {"host_index": 0, "new_host_index": 1}
+    # Our index from the join response goes back, not the host's.
+    assert mp.build_migration_response(1) == bytes.fromhex("4801")
+
+
+def test_the_station_named_next_host_owes_a_finish_not_a_response():
+    """`SendMigrationResponse` (0x017c3250) goes to the new host; the finish sender (0x017c2e90)
+    needs our index to be the host's."""
+    start = mp.parse_migration_start(SW83_MIGRATION_START)
+    our_index = 1                                     # the join response said 1
+    assert start["new_host_index"] == our_index       # so the console named US
+    assert mp.build_migration_finish(our_index) == bytes.fromhex("410101")
+    # The flag is read as a bool - 0x017c1014 is `cmp w19, #0; cset w1, ne`.
+    assert mp.build_migration_finish(our_index, ok=False) == bytes.fromhex("410100")
+    assert mp.parse_migration_finish(mp.build_migration_finish(our_index)) == {
+        "host_index": our_index, "flag": 1}
+
+
+def test_a_finish_is_refused_outside_the_station_bound():
+    with pytest.raises(ValueError):
+        mp.build_migration_finish(mp.MAX_STATION_INDEX + 1)

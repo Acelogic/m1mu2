@@ -1,0 +1,228 @@
+"""The 3456-byte trade snapshot a Sword sends on protocol 0x84, synthetic; the third fragment is
+compressed."""
+import struct
+import zlib
+
+import pytest
+
+from pokeldn import gen8
+from pokeldn.swsh import pokemon, trade_payload
+
+
+def a_payload(count=2, tid=56909, sid=48474, name="Player", started=(2019, 11, 15)):
+    """A whole 3456-byte snapshot: `count` party records, then the two trainer blocks."""
+    out = bytearray(PATTERN * (trade_payload.PAYLOAD_LENGTH // len(PATTERN) + 1))
+    out = out[:trade_payload.PAYLOAD_LENGTH]
+
+    for slot in range(pokemon.PARTY_SLOTS):
+        plain = bytearray(bytes(range(256)) * 2)[:gen8.SIZE_PARTY]
+        if slot >= count:
+            out[slot * gen8.SIZE_PARTY:(slot + 1) * gen8.SIZE_PARTY] = bytes(gen8.SIZE_PARTY)
+            continue
+        struct.pack_into("<I", plain, 0x00, 0x39C5F2CC + slot)
+        struct.pack_into("<H", plain, 0x04, 0)
+        struct.pack_into("<H", plain, gen8.OFF_SPECIES, 94 + slot)
+        struct.pack_into("<H", plain, gen8.OFF_TID, tid)
+        struct.pack_into("<H", plain, gen8.OFF_SID, sid)
+        plain[gen8.OFF_STAT_LEVEL] = 100 - slot
+        raw = pokemon.encrypt(bytes(plain))
+        out[slot * gen8.SIZE_PARTY:(slot + 1) * gen8.SIZE_PARTY] = raw
+
+    struct.pack_into("<I", out, trade_payload.PARTY_COUNT_OFFSET, count)
+
+    ms = trade_payload.MY_STATUS_OFFSET
+    struct.pack_into("<H", out, ms + trade_payload.MY_STATUS_TID, tid)
+    struct.pack_into("<H", out, ms + trade_payload.MY_STATUS_SID, sid)
+    out[ms + trade_payload.MY_STATUS_GAME] = 44                    # PKHeX GameVersion.SW
+    out[ms + trade_payload.MY_STATUS_GENDER] = 0
+    encoded = name.encode("utf-16-le").ljust(trade_payload.NAME_LENGTH, b"\x00")
+    out[ms + trade_payload.MY_STATUS_NAME:ms + trade_payload.MY_STATUS_NAME + len(encoded)] = encoded
+
+    tc = trade_payload.TRAINER_CARD_OFFSET
+    out[tc:tc + len(encoded)] = encoded
+    out[tc + trade_payload.TRAINER_CARD_LANGUAGE] = 3
+    struct.pack_into("<HBB", out, tc + trade_payload.TRAINER_CARD_STARTED, *started)
+    return bytes(out)
+
+
+PATTERN = bytes(range(256))
+
+
+def fragments_of(payload, compress_last=True):
+    """The payload as the console sends it: 1404, 1404, and a compressed remainder."""
+    first, second, rest = payload[:1404], payload[1404:2808], payload[2808:]
+    return [first, second, zlib.compress(rest) if compress_last else rest]
+
+
+def test_the_third_fragment_is_compressed_and_the_whole_payload_is_3456():
+    payload = a_payload()
+    frags = fragments_of(payload)
+    assert len(frags[2]) < len(payload) - 2808, "the third fragment should compress"
+    assert trade_payload.reassemble(frags) == payload
+    assert len(payload) == trade_payload.PAYLOAD_LENGTH == 3456
+
+
+def test_concatenating_the_compressed_fragment_raw_is_refused():
+    frags = fragments_of(a_payload())
+    short = b"".join(frags)
+    assert len(short) < trade_payload.PAYLOAD_LENGTH
+    with pytest.raises(ValueError, match="expected 3456"):
+        trade_payload.read(short)
+
+
+def test_a_missing_fragment_is_refused_rather_than_read_as_a_short_payload():
+    frags = fragments_of(a_payload())
+    with pytest.raises(ValueError, match="expected 3"):
+        trade_payload.reassemble(frags[:2])
+    with pytest.raises(ValueError, match="a fragment is missing"):
+        trade_payload.reassemble([frags[0], frags[1], frags[2][:8]])
+
+
+def test_an_uncompressed_third_fragment_still_reassembles():
+    """`inflate` passes a non-zlib fragment through unchanged."""
+    payload = a_payload()
+    assert trade_payload.reassemble(fragments_of(payload, compress_last=False)) == payload
+
+
+def test_the_trainer_blocks_and_the_party_name_one_trainer():
+    fields = trade_payload.read(a_payload(count=3))
+    assert fields["party_count"] == 3
+    assert [p is not None for p in fields["party"]] == [True, True, True, False, False, False]
+    assert fields["trainer_name"] == fields["card_name"] == "Player"
+    assert (fields["trainer_id"], fields["secret_id"]) == (56909, 48474)
+    assert fields["game"] == 44 and fields["card_language"] == 3
+    assert fields["started"] == (2019, 11, 15)
+    assert trade_payload.party_matches_trainer(fields) is True
+
+
+def test_a_party_carrying_another_trainers_ids_is_visible_as_such():
+    payload = bytearray(a_payload(count=1))
+    ms = trade_payload.MY_STATUS_OFFSET
+    struct.pack_into("<H", payload, ms + trade_payload.MY_STATUS_TID, 1)
+    assert trade_payload.party_matches_trainer(trade_payload.read(bytes(payload))) is False
+
+
+def test_our_snapshot_survives_the_round_trip_the_console_will_put_it_through():
+    """Build, frame on 0x84, reassemble as a receiver does, read back."""
+    from pokeldn.ldn import broadcast4
+
+    ours = trade_payload.rewrite(a_payload(count=3), trainer_name="PkCamp",
+                                 trainer_id=12345, secret_id=54321)
+    messages = broadcast4.Sender().transfer(ours)
+    control = broadcast4.parse(messages[0][0])
+    assert control["is_control"] and control["total"] == trade_payload.PAYLOAD_LENGTH
+
+    fragments = []
+    for message, compressed in messages[1:]:
+        got = broadcast4.parse(message)
+        fragments.append(zlib.decompress(got["body"]) if compressed else got["body"])
+    assert len(fragments) == trade_payload.FRAGMENT_COUNT
+    assert trade_payload.reassemble(fragments) == ours
+
+    back = trade_payload.read(ours)
+    assert back["trainer_name"] == back["card_name"] == "PkCamp"
+    assert (back["trainer_id"], back["secret_id"]) == (12345, 54321)
+    assert trade_payload.party_matches_trainer(back), "the party must name the trainer we became"
+    assert [p["ot_name"] for p in back["party"] if p] == ["PkCamp"] * 3
+    assert back["party_count"] == 3
+
+
+def test_a_short_session_58_payload_is_repaired_and_anything_else_is_refused():
+    frags = fragments_of(a_payload())
+    short = b"".join(frags)
+    with pytest.raises(ValueError, match="neither whole"):
+        trade_payload.inflate_short(short)          # our synthetic one is not 2965 bytes
+    with pytest.raises(ValueError, match="neither whole"):
+        trade_payload.inflate_short(b"\x00" * 100)
+
+
+# A retail Sword's profile, ids zeroed and post-terminator slack cleared (docs/swsh_protocol.md, The
+# player profile).
+
+PROFILE = bytes.fromhex(
+    "00" * 0x28
+    + "470075007200760061006e00" + "00" * 12                     # the name, 24 bytes
+    + "0c11011c610000040400801540dc80830e5c7450040203200202"     # appearance, bit-packed
+    + "c607"                                                     # sample header
+    + "4b607044478ba5c6425c9a5d477c7c24bf"                       # three samples, counters 11 10 9
+    + "4a607044478ba5c6425c9a5d477c7c24bf"
+    + "49607044478ba5c6425c9a5d477c7c24bf"
+    + "010d" + "00" * 33 + "aa" + "00" * 39                      # activity 13, its u16 170
+    + "e001e3004e070000320000001c000400ac00b80004003e00f60f0b009c05f702"   # sixteen records
+    + "00" * 16)
+assert len(PROFILE) == trade_payload.PROFILE_LENGTH
+
+
+def a_payload_with_the_profile(**kw):
+    out = bytearray(a_payload(name="Gurvan", **kw))
+    out[trade_payload.TAIL_OFFSET:] = PROFILE.ljust(trade_payload.TAIL_LENGTH, b"\x00")
+    return bytes(out)
+
+
+def test_the_profile_reads_back_field_by_field():
+    t = trade_payload.read_tail(a_payload_with_the_profile())
+    assert t["name"] == "Gurvan"
+    assert (t["gender"], t["language"]) == (0, 3)                 # male, French
+    assert t["appearance"] == [1, 71, 6, 0, 4, 1, 0, 86, 64, 55, 56, 58, 92, 29, 69, 8, 3]
+    assert t["appearance_tail"] == (0, 2, 8)
+    assert [s["counter"] for s in t["samples"]] == [11, 10, 9]
+    assert {s["state"] for s in t["samples"]} == {2}
+    x, y, z = t["samples"][0]["position"]
+    assert (round(x, 1), round(y, 1), round(z, 1)) == (50288.4, 99.3, 56730.4)
+    assert round(t["samples"][0]["yaw"], 3) == -0.643
+    assert (t["sample_generation"], t["sample_player_byte"]) == (198, 7)
+    assert t["sample_flags"] == (2, 0) and t["sample_end"] == 1
+    assert (t["activity"], t["location"]) == (13, 170)                # Challenge Beach
+    assert t["records"]["total_capture"] == 480
+    assert t["records"]["egg_hatching"] == 1870
+    assert t["records"]["trade"] == 50
+    assert t["records"]["bike_dash"] == 4086
+    assert t["optional_u64"] == 0
+    assert not any(t["extra_block"]) and len(t["extra_block"]) == 0x188
+
+
+def test_the_profile_name_is_the_fourth_copy_and_moves_with_the_others():
+    payload = a_payload_with_the_profile()
+    at = trade_payload.TAIL_OFFSET + trade_payload.TAIL_NAME_OFFSET
+    assert at == 0xB14
+    out = trade_payload.rewrite(payload, trainer_name="PkCamp", trainer_id=12345, secret_id=54321)
+    assert out.find("Gurvan".encode("utf-16-le")) < 0            # nowhere in the payload at all
+    assert out.count("PkCamp".encode("utf-16-le")) == 3          # status, card, and the profile
+    assert out[at:at + 24] == "PkCamp".encode("utf-16-le") + b"\x00" * 12
+    assert trade_payload.read_tail(out)["name"] == "PkCamp"
+    assert trade_payload.party_matches_trainer(trade_payload.read(out))
+    changed = {i for i in range(0xAEC, 0xD80) if payload[i] != out[i]}
+    assert changed <= set(range(at, at + 24))
+
+
+@pytest.mark.parametrize("tid, sid, shown", [
+    (56909, 48474, 848973),     # a retail Sword's MyStatus and the id its League Card carried
+    (56983, 22788, 491351),     # an emulated Shield save, the same pair read out of its blocks
+])
+def test_the_league_card_id_follows_the_identity_it_is_derived_from(tid, sid, shown):
+    """TrainerCard+0x1C is (SID << 16 | TID) mod 10**6 on both saves; a console keeps a partner's
+    card unless it holds one with that id (docs/swsh_trade.md, The League Card)."""
+    at = trade_payload.TRAINER_CARD_OFFSET + 0x1C
+    out = trade_payload.rewrite(a_payload(), trainer_id=tid, secret_id=sid)
+    assert struct.unpack_from("<I", out, at)[0] == shown
+
+
+def test_the_three_ids_are_replaced_in_place_and_nowhere_else():
+    payload = a_payload_with_the_profile()
+    device, uid, nsa = bytes(range(1, 17)), bytes(range(0x20, 0x30)), bytes(range(0x40, 0x48))
+    out = trade_payload.rewrite(payload, device_id=device, account_uid=uid, nsa_id=nsa)
+    t = trade_payload.read_tail(out)
+    assert (t["device_id"], t["account_uid"], t["nsa_id"]) == (device, uid, nsa)
+    changed = {i for i in range(len(payload)) if payload[i] != out[i]}
+    assert changed == set(range(trade_payload.TAIL_OFFSET, trade_payload.TAIL_OFFSET + 0x28))
+    for bad in (dict(device_id=b"\x00" * 8), dict(account_uid=b"\x00" * 8), dict(nsa_id=b"\x00" * 16)):
+        with pytest.raises(ValueError):
+            trade_payload.rewrite(payload, **bad)
+
+
+def test_the_records_are_named_in_the_order_the_game_writes_them():
+    # 0x010f5060 reads sixteen Record8 indexes and clamps each to 0xFFFF
+    assert trade_payload.RECORD_INDEXES == (6, 32, 0, 33, 17, 27, 34, 24, 12, 3, 10, 35, 38, 7, 36, 37)
+    assert len(trade_payload.RECORD_NAMES) == 16
+    assert trade_payload.TAIL_RECORDS + 32 == trade_payload.TAIL_OPTIONAL_U64
+    assert trade_payload.EXTRA_BLOCK_OFFSET == 0xBF6

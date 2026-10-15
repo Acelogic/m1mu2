@@ -1,0 +1,195 @@
+"""The 188-byte BattleTowerEReaderTrainer [decomp:include/global.h:286, include/pokemon.h:143] and
+the session that sends it."""
+import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+import pytest  # noqa: E402
+
+from pokeldn.frlg.gift import ereader_trainer, gift_composer, gift_registry, mg_server, wonder_card_events  # noqa: E402
+from pokeldn.frlg.text import charmap, easychat  # noqa: E402
+from pokeldn.frlg.gift.ereader_trainer import (  # noqa: E402
+    EReaderTrainerError, TrainerMon, VisitingTrainer,
+)
+
+
+def _mon(**overrides):
+    fields = dict(species=25, nickname="PIKACHU", level=50, moves=(85,))
+    fields.update(overrides)
+    return TrainerMon(**fields)
+
+
+def _trainer(**overrides):
+    fields = dict(name="RED", trainer_class="red", party=(_mon(), _mon(), _mon()))
+    fields.update(overrides)
+    return VisitingTrainer(**fields)
+
+
+def test_the_packed_trainer_is_exactly_the_struct_size():
+    packed = _trainer().pack()
+    assert len(packed) == ereader_trainer.TRAINER_SIZE == 0xBC
+    # party[3] starts at 0x34 and the checksum is the last word.
+    assert 0x34 + 3 * ereader_trainer.MON_SIZE == 0xB8
+
+
+def test_header_fields_land_at_the_struct_offsets():
+    packed = _trainer(name="LEAF", trainer_class="leaf", trainer_id=0x11223344,
+                      win_streak=7, unk0=1).pack()
+    assert packed[0x00] == 1                                            # unk0
+    assert packed[0x01] == ereader_trainer.FACILITY_CLASSES["leaf"]     # trainerClass
+    assert int.from_bytes(packed[0x02:0x04], "little") == 7             # winStreak
+    assert charmap.decode(packed[0x04:0x0C]) == "LEAF"                  # name[8]
+    assert int.from_bytes(packed[0x0C:0x10], "little") == 0x11223344    # trainerId[4]
+
+
+def test_the_three_phrases_are_six_easy_chat_words_each_in_struct_order():
+    trainer = _trainer(greeting=("hello",), farewell_player_lost=("darn",),
+                       farewell_player_won=("wow",))
+    packed = trainer.pack()
+
+    def words(offset):
+        return tuple(int.from_bytes(packed[offset + i * 2:offset + i * 2 + 2], "little")
+                     for i in range(easychat.TRAINER_LINE_LENGTH))
+
+    pad = (easychat.UNDEFINED,) * 5
+    assert words(0x10) == (easychat.WORDS["hello"],) + pad      # greeting
+    assert words(0x1C) == (easychat.WORDS["darn"],) + pad       # farewellPlayerLost
+    assert words(0x28) == (easychat.WORDS["wow"],) + pad        # farewellPlayerWon
+
+
+def test_a_mon_packs_every_field_the_console_reads_back():
+    """CreateBattleTowerMon copies all of these straight onto the party mon
+    [decomp:src/pokemon.c CreateBattleTowerMon]."""
+    mon = _mon(species=6, nickname="CHARIZARD", level=70, held_item=200,
+               moves=(53, 337, 332, 89), evs=(1, 2, 3, 4, 5, 6),
+               ivs=(31, 30, 29, 28, 27, 26), ability_num=1, friendship=200,
+               pp_bonuses=0xFF, personality=0xDEADBEEF, ot_id=0xCAFEF00D)
+    packed = mon.pack()
+    assert len(packed) == ereader_trainer.MON_SIZE == 0x2C
+    assert int.from_bytes(packed[0x00:0x02], "little") == 6
+    assert int.from_bytes(packed[0x02:0x04], "little") == 200
+    assert [int.from_bytes(packed[0x04 + i * 2:0x06 + i * 2], "little")
+            for i in range(4)] == [53, 337, 332, 89]
+    assert packed[0x0C] == 70
+    assert packed[0x0D] == 0xFF
+    assert list(packed[0x0E:0x14]) == [1, 2, 3, 4, 5, 6]        # hp/atk/def/spe/spa/spd EVs
+    assert int.from_bytes(packed[0x14:0x18], "little") == 0xCAFEF00D
+    bits = int.from_bytes(packed[0x18:0x1C], "little")
+    assert [(bits >> (5 * i)) & 0x1F for i in range(6)] == [31, 30, 29, 28, 27, 26]
+    assert (bits >> 31) & 1 == 1                                 # abilityNum
+    assert int.from_bytes(packed[0x1C:0x20], "little") == 0xDEADBEEF
+    assert charmap.decode(packed[0x20:0x2B]) == "CHARIZARD"
+    assert packed[0x2B] == 200
+
+
+def test_unused_move_slots_are_zero():
+    packed = _mon(moves=(85, 98)).pack()
+    assert int.from_bytes(packed[0x08:0x0A], "little") == 0
+    assert int.from_bytes(packed[0x0A:0x0C], "little") == 0
+
+
+def test_the_checksum_is_the_sum_of_every_word_but_the_last():
+    packed = _trainer().pack()
+    expected = sum(int.from_bytes(packed[off:off + 4], "little")
+                   for off in range(0, ereader_trainer.TRAINER_SIZE - 4, 4)) & 0xFFFFFFFF
+    assert int.from_bytes(packed[0xB8:0xBC], "little") == expected
+    assert ereader_trainer.validate(packed)
+
+
+def test_a_corrupted_struct_is_rejected_the_way_the_console_rejects_it():
+    packed = bytearray(_trainer().pack())
+    packed[0x04] ^= 0x01                    # one byte of the name
+    assert not ereader_trainer.validate(bytes(packed))
+    assert not ereader_trainer.validate(bytes(ereader_trainer.TRAINER_SIZE))
+
+
+def test_validate_insists_on_the_exact_length():
+    with pytest.raises(EReaderTrainerError):
+        ereader_trainer.validate(b"\x00" * 100)
+
+
+def test_the_party_must_be_exactly_three():
+    with pytest.raises(EReaderTrainerError):
+        _trainer(party=(_mon(), _mon())).pack()
+
+
+def test_a_mon_needs_at_least_one_move():
+    with pytest.raises(EReaderTrainerError):
+        _mon(moves=()).pack()
+
+
+def test_out_of_range_fields_are_refused():
+    for kwargs in (dict(level=0), dict(level=101), dict(ivs=32), dict(evs=256),
+                   dict(ability_num=2), dict(species=0)):
+        with pytest.raises(EReaderTrainerError):
+            _mon(**kwargs).pack()
+
+
+def test_an_unknown_class_or_nature_is_refused():
+    with pytest.raises(EReaderTrainerError):
+        _trainer(trainer_class="gym leader giovanni").pack()
+    with pytest.raises(EReaderTrainerError):
+        ereader_trainer.personality_for("splendid")
+
+
+def test_a_name_longer_than_the_field_is_refused_and_five_characters_are_displayed():
+    with pytest.raises(EReaderTrainerError):
+        _trainer(name="ABCDEFGH").pack()
+    # CopyEReaderTrainerName5 shows five [decomp:src/battle_tower.c:1343].
+    assert _trainer(name="MERCURY").display_name == "MERCU"
+
+
+def test_personality_picks_the_nature_and_can_force_a_shiny():
+    for index, nature in enumerate(ereader_trainer.NATURES):
+        assert ereader_trainer.personality_for(nature) % 25 == index
+    shiny = ereader_trainer.personality_for("jolly", ot_id=0x1234, shiny=True)
+    assert shiny % 25 == ereader_trainer.NATURES.index("jolly")
+    assert ereader_trainer.is_shiny(shiny, 0x1234)
+    assert not ereader_trainer.is_shiny(ereader_trainer.personality_for("jolly"), 0xFFFF0000)
+
+
+def test_the_gift_flag_id_stays_out_of_the_ticket_flags():
+    """sReceivedGiftFlags[0..2] are FLAG_RECEIVED_AURORA_TICKET, _MYSTIC_TICKET and _OLD_SEA_MAP
+    [decomp:src/mystery_gift.c:30]; only 1003 and up are spare."""
+    assert wonder_card_events.VISITING_TRAINER_FLAG_ID >= 1003
+
+
+def test_a_definition_with_a_broken_trainer_is_refused():
+    import dataclasses
+    broken = dataclasses.replace(
+        wonder_card_events.VISITING_TRAINER_GIFT,
+        trainer=bytes(ereader_trainer.TRAINER_SIZE))
+    with pytest.raises(gift_composer.GiftValidationError):
+        gift_composer.validate_definition(broken)
+    with pytest.raises(gift_composer.GiftValidationError):
+        gift_composer.validate_definition(
+            dataclasses.replace(wonder_card_events.VISITING_TRAINER_GIFT, trainer=b"\x01\x02"))
+
+
+def _server(**kwargs):
+    distribution = gift_registry.GIFT_REGISTRY.build_distribution("visiting-trainer")
+    return mg_server.MysteryGiftServer(
+        distribution.card, distribution.ram_script, trainer=distribution.trainer, **kwargs)
+
+
+def test_the_server_refuses_a_trainer_the_console_would_clear():
+    distribution = gift_registry.GIFT_REGISTRY.build_distribution("visiting-trainer")
+    with pytest.raises(mg_server.MysteryGiftServerError):
+        mg_server.MysteryGiftServer(distribution.card, distribution.ram_script,
+                                    trainer=bytes(ereader_trainer.TRAINER_SIZE))
+    with pytest.raises(mg_server.MysteryGiftServerError):
+        mg_server.MysteryGiftServer(distribution.card, distribution.ram_script,
+                                    trainer=b"\x01" * 10)
+
+
+def test_a_stamp_rally_and_a_trainer_cannot_share_a_session():
+    distribution = gift_registry.GIFT_REGISTRY.build_distribution("solrock-stamp")
+    with pytest.raises(mg_server.MysteryGiftServerError):
+        mg_server.MysteryGiftServer(
+            distribution.card, distribution.ram_script,
+            stamp=distribution.stamp,
+            activation_script=distribution.activation_script,
+            install_activation_script=distribution.install_activation_script,
+            trainer=gift_registry.GIFT_REGISTRY.build_distribution(
+                "visiting-trainer").trainer)

@@ -1,0 +1,275 @@
+"""SEAD's RNG and the Pia 5.x LDN session key, checked against the published formula."""
+
+import os
+import struct
+import sys
+
+import pytest
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from pokeldn.ldn.pia5 import ldn_session_key                    # noqa: E402
+from pokeldn.ldn.sead import Sead  # noqa: E402
+
+M32 = 0xFFFFFFFF
+
+
+def reference_state(seed):
+    """The published init, written out longhand."""
+    temp, state = seed, []
+    for i in range(1, 5):
+        temp ^= temp >> 30
+        temp = (temp * 0x6C078965 + i) & M32
+        state.append(temp)
+    return state
+
+
+def reference_draws(seed, count):
+    """The published u32(), written out longhand."""
+    s = reference_state(seed)
+    out = []
+    for _ in range(count):
+        t = (s[0] ^ (s[0] << 11)) & M32
+        t ^= t >> 8
+        t ^= s[3]
+        t ^= s[3] >> 19
+        t &= M32
+        s = [s[1], s[2], s[3], t]
+        out.append(t)
+    return out
+
+
+@pytest.mark.parametrize("seed", [0, 1, 31, 0x59E0DE36, 0xFFFFFFFF])
+def test_init_matches_the_published_formula(seed):
+    assert Sead(seed=seed).state == reference_state(seed)
+
+
+@pytest.mark.parametrize("seed", [0, 31, 0x59E0DE36])
+def test_draws_match_the_published_generator(seed):
+    assert [Sead(seed=seed).u32() for _ in range(1)] == reference_draws(seed, 1)
+    r = Sead(seed=seed)
+    assert [r.u32() for _ in range(8)] == reference_draws(seed, 8)
+
+
+def test_a_seed_is_only_a_shorthand_for_the_state_it_builds():
+    state = reference_state(7)
+    assert Sead(seed=7).u32() == Sead(state=state).u32()
+
+
+def test_bytes_packs_each_draw_little_endian():
+    assert Sead(seed=0).bytes(16) == struct.pack("<4I", *reference_draws(0, 4))
+
+
+def test_bytes_refuses_a_size_that_is_not_whole_words():
+    with pytest.raises(ValueError):
+        Sead(seed=0).bytes(15)
+
+
+def test_constructing_with_both_or_neither_is_refused():
+    with pytest.raises(ValueError):
+        Sead()
+    with pytest.raises(ValueError):
+        Sead(seed=1, state=[0, 0, 0, 0])
+    with pytest.raises(ValueError):
+        Sead(state=[1, 2, 3])
+
+
+def test_ldn_session_key_refuses_a_key_that_is_not_sixteen_bytes():
+    with pytest.raises(ValueError):
+        ldn_session_key(b"\x00" * 15, 1)
+
+
+def test_gcm_iv_refuses_a_nonce_that_is_not_eight_bytes():
+    from pokeldn.ldn.pia5 import gcm_iv
+    with pytest.raises(ValueError):
+        gcm_iv(0, 0, b"\x00" * 7)
+
+
+# The BDSP session values a real capture authenticates with.
+
+BDSP_SEED = bytes.fromhex("9918bd0fdcfa65779918bd0fdcfa6577")   # cryptoKeyDataSeed, from metadata
+BDSP_KEY = bytes.fromhex("9900bd0cdcfa65639918bd0fc7fa6577")    # what Pia is handed, version 199
+SP4_NETID_LE = bytes.fromhex("b4c85cf8")                        # advertisement +0x00
+SP4_MAC = bytes.fromhex("48f1eb209b22")                         # the console's MAC
+SP4_SESSPARAM = 0x36DEE059                                      # advertisement +0x0c, LE
+SP4_SESSION_KEY = bytes.fromhex("7b182cb087eeabd228a2efd91a8be147")
+
+
+def test_the_published_game_key_is_the_seed_derived_with_the_version():
+    """The four bytes that differ from the seed are the four the game overwrites."""
+    from pokeldn.ldn.pia5 import ldn_game_key
+    assert ldn_game_key(BDSP_SEED, 199) == BDSP_KEY
+    differing = [i for i in range(16) if BDSP_SEED[i] != BDSP_KEY[i]]
+    assert differing == [1, 3, 7, 12]
+
+
+def test_a_different_version_moves_only_those_four_bytes():
+    from pokeldn.ldn.pia5 import ldn_game_key
+    other = ldn_game_key(BDSP_SEED, 200)
+    assert [i for i in range(16) if other[i] != BDSP_SEED[i]] == [1, 3, 7, 12]
+    assert other != BDSP_KEY
+
+
+def test_game_key_refuses_a_seed_that_is_not_sixteen_bytes():
+    from pokeldn.ldn.pia5 import ldn_game_key
+    with pytest.raises(ValueError):
+        ldn_game_key(b"\x00" * 15, 199)
+
+
+def test_the_nonce_crc_is_over_the_network_id_then_the_mac():
+    from pokeldn.ldn.pia5 import ldn_nonce_crc
+    assert ldn_nonce_crc(SP4_NETID_LE, SP4_MAC) == 0xDA291352
+
+
+def test_the_nonce_crc_rejects_the_wrong_field_sizes():
+    from pokeldn.ldn.pia5 import ldn_nonce_crc
+    with pytest.raises(ValueError):
+        ldn_nonce_crc(SP4_NETID_LE, b"\x00" * 4)
+    with pytest.raises(ValueError):
+        ldn_nonce_crc(b"\x00" * 6, SP4_MAC)
+
+
+def test_the_session_key_of_the_captured_bdsp_session():
+    from pokeldn.ldn.pia5 import ldn_session_key
+    assert ldn_session_key(BDSP_KEY, SP4_SESSPARAM) == SP4_SESSION_KEY
+
+
+def test_the_whole_chain_reproduces_the_iv_of_a_captured_packet():
+    """seed -> key -> session key, and network id + MAC -> CRC -> IV, as a run authenticates."""
+    from pokeldn.ldn.pia5 import gcm_iv, ldn_game_key, ldn_nonce_crc
+    key = ldn_game_key(BDSP_SEED, 199)
+    crc = ldn_nonce_crc(SP4_NETID_LE, SP4_MAC)
+    iv = gcm_iv(crc, 0x11BAC90D, bytes.fromhex("f5a83bd383ce712d"))
+    assert iv == bytes.fromhex("da29130df5a83bd383ce712d")
+    assert key == BDSP_KEY
+
+
+def _msg(present, *, mflags=None, size=None, proto=None, port=None, dest=None, payload=b""):
+    out = bytes([present])
+    if mflags is not None: out += bytes([mflags])
+    if size is not None: out += struct.pack(">H", size)
+    if proto is not None: out += bytes([proto]) + port.to_bytes(3, "big")
+    if dest is not None: out += struct.pack(">Q", dest)
+    out += payload
+    return out + b"\x00" * (-len(out) % 4)
+
+
+def test_one_message_parses_with_every_field_present():
+    from pokeldn.ldn.pia5 import parse_messages
+    body = bytes(range(20))
+    m = parse_messages(_msg(0x0F, mflags=0x11, size=len(body), proto=36, port=0,
+                            dest=0, payload=body))
+    assert len(m) == 1
+    assert (m[0].message_flags, m[0].protocol, m[0].port) == (0x11, 36, 0)
+    assert m[0].payload == body
+
+
+def test_absent_fields_inherit_from_the_previous_message():
+    """The whole point of the presence byte: a follow-up message can be flags plus a payload."""
+    from pokeldn.ldn.pia5 import parse_messages
+    first = _msg(0x0F, mflags=0x11, size=8, proto=36, port=7, dest=0x1122334455667788,
+                 payload=b"A" * 8)
+    second = _msg(0x00 | 0x02, size=4, payload=b"B" * 4)
+    m = parse_messages(first + second)
+    assert len(m) == 2
+    assert m[1].protocol == 36 and m[1].port == 7
+    assert m[1].message_flags == 0x11
+    assert m[1].destination == 0x1122334455667788
+    assert m[1].payload == b"BBBB"
+
+
+def test_the_walk_stops_at_the_0xff_padding():
+    from pokeldn.ldn.pia5 import parse_messages
+    m = parse_messages(_msg(0x0F, mflags=1, size=4, proto=9, port=0, dest=0, payload=b"wxyz")
+                       + b"\xff" * 12)
+    assert len(m) == 1 and m[0].payload == b"wxyz"
+
+
+def test_messages_are_padded_to_four_bytes():
+    """A 5-byte payload leaves three bytes of padding; the next message must still be found."""
+    from pokeldn.ldn.pia5 import parse_messages
+    m = parse_messages(_msg(0x0F, mflags=1, size=5, proto=9, port=0, dest=0, payload=b"12345")
+                       + _msg(0x02, size=2, payload=b"ok"))
+    assert [x.payload for x in m] == [b"12345", b"ok"]
+
+
+def test_a_size_running_past_the_buffer_is_refused_not_read():
+    from pokeldn.ldn.pia5 import parse_messages
+    assert parse_messages(_msg(0x0F, mflags=1, size=900, proto=9, port=0, dest=0)) == []
+
+
+def test_a_truncated_header_does_not_raise():
+    from pokeldn.ldn.pia5 import parse_messages
+    for n in range(1, 16):
+        parse_messages(bytes([0x0F]) + b"\x01" * n)
+
+
+def test_an_empty_or_all_padding_payload_yields_nothing():
+    from pokeldn.ldn.pia5 import parse_messages
+    assert parse_messages(b"") == []
+    assert parse_messages(b"\xff" * 16) == []
+
+
+# Re-encrypting the console's own plaintext reproduced its ciphertext and tag for all 674 captured
+# packets.
+
+def test_decrypt_returns_none_rather_than_raising_on_a_bad_tag():
+    """Callers sweep candidate keys against this, so a miss must be cheap and not an exception."""
+    from pokeldn.ldn.pia5 import decrypt_payload, encrypt_payload
+    sk, iv = bytes(range(16)), bytes(range(12))
+    ct, tag = encrypt_payload(sk, iv, b"hello world 1234")
+    assert decrypt_payload(sk, iv, ct, tag) == b"hello world 1234"
+    assert decrypt_payload(sk, iv, ct, bytes(8)) is None
+    assert decrypt_payload(sk, bytes(12), ct, tag) is None
+    assert decrypt_payload(bytes(16), iv, ct, tag) is None
+
+
+def test_the_payload_is_0xff_padded_to_sixteen():
+    from pokeldn.ldn.pia5 import pad_payload
+    assert pad_payload(b"") == b""
+    assert pad_payload(b"a" * 16) == b"a" * 16
+    assert pad_payload(b"a" * 17) == b"a" * 17 + b"\xff" * 15
+    assert len(pad_payload(b"x" * 137)) == 144
+
+
+def test_a_built_message_parses_back_to_what_went_in():
+    from pokeldn.ldn.pia5 import build_message, parse_messages
+    body = bytes(range(30))
+    m = parse_messages(build_message(body, protocol=36, port=7, message_flags=0x11,
+                                     destination=0xDEADBEEF))
+    assert len(m) == 1
+    assert m[0].payload == body
+    assert (m[0].protocol, m[0].port, m[0].message_flags) == (36, 7, 0x11)
+    assert m[0].destination == 0xDEADBEEF
+
+
+def test_an_inheriting_message_carries_only_its_size():
+    from pokeldn.ldn.pia5 import build_message, parse_messages
+    first = build_message(b"A" * 8, protocol=36, port=7, message_flags=0x11, destination=5)
+    second = build_message(b"BBBB", protocol=0, inherit=True)
+    assert len(second) == 8                                  # 1 flag + 2 size + 4 payload, padded
+    m = parse_messages(first + second)
+    assert [x.payload for x in m] == [b"A" * 8, b"BBBB"]
+    assert m[1].protocol == 36 and m[1].port == 7 and m[1].destination == 5
+
+
+def test_a_whole_packet_round_trips_header_messages_and_crypto():
+    """header || tag || ciphertext, the way a sent packet is assembled."""
+    from pokeldn.ldn.pia5 import (PiaHeader5, build_message, decrypt_payload, encrypt_payload,
+                                  gcm_iv, ldn_nonce_crc, ldn_session_key, pad_payload,
+                                  parse_messages)
+    sk = ldn_session_key(BDSP_KEY, SP4_SESSPARAM)
+    nonce8 = struct.pack(">Q", 0xF5A83BD383CE712D)
+    src_var = 0x11BAC90D
+    iv = gcm_iv(ldn_nonce_crc(SP4_NETID_LE, SP4_MAC), src_var, nonce8)
+    body = pad_payload(build_message(b"payload bytes", protocol=36))
+    ct, tag = encrypt_payload(sk, iv, body)
+    header = PiaHeader5(src_var=src_var, nonce8=nonce8, tag=tag).pack()
+    packet = header + ct
+    assert len(header) == 0x20
+    back = PiaHeader5.parse(packet)
+    assert back.src_var == src_var and back.nonce8 == nonce8 and back.encrypted
+    pt = decrypt_payload(sk, gcm_iv(ldn_nonce_crc(SP4_NETID_LE, SP4_MAC), back.src_var,
+                                    back.nonce8), packet[0x20:], back.tag)
+    assert pt == body
+    assert parse_messages(pt)[0].payload == b"payload bytes"

@@ -1,0 +1,52 @@
+"""The game's stream layer on Reliable (10) and Broadcast Reliable (11): a protocol-11 payload opens
+with the sender's four-byte station prefix, which the declared length leaves out; a frame cut at the
+declared length is dropped (docs/za.md).
+"""
+from pokeldn.ldn import reliable
+
+PROTO_RELIABLE = 10
+PROTO_BROADCAST = 11
+
+PREFIX_JOINER = bytes.fromhex("00000001")
+PREFIX_HOST = bytes.fromhex("00000002")
+
+ACK_STATIONS = 4                  # entries a broadcast acknowledgement carries
+PREFIX_SIZE = 4                   # the station prefix, outside the sub-header's declared length
+IDLE_NEXT = 0xFFF0                # the sequence base a station that has sent nothing reports
+
+
+def build_ack(next_expected, mask=b"\x00" * 16):
+    """The unicast acknowledgement of protocol 10: stream, marker, next expected, mask."""
+    return reliable.build_bulk_ack(next_expected, mask)
+
+
+def build_broadcast_ack(next_expected, mask=b"\x00" * 16, *, prefix=PREFIX_JOINER, entry=0):
+    """The acknowledgement of protocol 11: the prefix, then four 18-byte station entries (78 bytes);
+    a joiner acknowledges in entry 0, a host in entry 1."""
+    out = bytearray(prefix)
+    out += bytes([0x00, ACK_STATIONS])
+    for i in range(ACK_STATIONS):
+        if i == entry:
+            out += (next_expected & 0xFFFF).to_bytes(2, "big") + bytes(mask).ljust(16, b"\x00")[:16]
+        else:
+            out += IDLE_NEXT.to_bytes(2, "big") + bytes(16)
+    return bytes(out)
+
+
+def build_broadcast(payload, *, prefix=PREFIX_JOINER):
+    """Application data on protocol 11 carries the sending station's four bytes in front."""
+    return bytes(prefix) + bytes(payload)
+
+
+def frame(seq, ack, payload, flags_a, recipients):
+    """A protocol-11 reliable frame: `payload` starts with the station prefix, which the declared
+    length leaves out."""
+    out = bytearray(reliable.build_reliable(seq, ack, payload, flagsA=flags_a,
+                                            recipients=recipients))
+    out[1:3] = (len(payload) - PREFIX_SIZE).to_bytes(2, "big")
+    return bytes(out)
+
+
+def frame_payload(message):
+    """The whole payload of a received protocol-11 frame, prefix included."""
+    return message[8:8 + int.from_bytes(message[1:3], "big") + PREFIX_SIZE]

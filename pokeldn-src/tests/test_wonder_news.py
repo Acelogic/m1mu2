@@ -1,0 +1,227 @@
+#!/usr/bin/env python3
+"""The Wonder News half of the Mystery Gift menu [sServerScript_SendNews, decomp:src/mystery_gift_scripts.c:126].
+
+The beacon's activity must be ACTIVITY_WONDER_NEWS (22) [src/data/union_room.h:406], and only a
+FALSE MG_LINKID_RESPONSE makes the console save the news [mystery_gift_menu.c:1367].
+
+Run standalone (no pytest needed):   python tests/test_wonder_news.py
+"""
+
+import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from pokeldn import config as configmod  # noqa: E402
+from pokeldn.frlg.gift import host_mystery_gift, mg_client, mg_script, mg_server, stamp_rally, wonder_news  # noqa: E402
+from pokeldn.frlg.link import beacon
+from pokeldn.frlg.link import host_beacon
+from pokeldn.ldn import transport  # noqa: E402
+from pokeldn.frlg.gift import mystery_gift as mg  # noqa: E402
+from tests.test_mystery_gift_flow import ConsoleClientModel, _drive  # noqa: E402
+
+
+def _news(**overrides):
+    return wonder_news.PKCAMP_NEWS.build(**overrides)
+
+
+def _distribution(news=None):
+    return stamp_rally.MysteryGiftDistribution(
+        None, None, news=_news() if news is None else news)
+
+
+def test_the_news_struct_is_the_444_byte_layout_the_console_memcpys():
+    news = _news()
+    assert len(news) == wonder_news.WONDER_NEWS_SIZE == 444
+    # u16 id; u8 sendType; u8 bgType; u8 titleText[40]; u8 bodyText[10][40] [global.h:646].
+    assert int.from_bytes(news[0:2], "little") == wonder_news.PKCAMP_NEWS.news_id
+    assert news[2] == wonder_news.PKCAMP_NEWS.send_type
+    assert news[3] == wonder_news.PKCAMP_NEWS.bg_type
+    assert 4 + 40 + 10 * 40 == wonder_news.WONDER_NEWS_SIZE
+    parsed = wonder_news.parse(news)
+    assert parsed["title"] == wonder_news.PKCAMP_NEWS.title
+    assert parsed["body"][:len(wonder_news.PKCAMP_NEWS.body)] == wonder_news.PKCAMP_NEWS.body
+    # EOS-terminated and 0xFF-padded; the console appends its own EOS
+    # [mystery_gift_show_news.c:338].
+    title = news[4:44]
+    assert title[len(parsed["title"])] == 0xFF and set(title[len(parsed["title"]):]) == {0xFF}
+    assert set(news[44 + 3 * 40:44 + 4 * 40]) == {0xFF}   # the deliberately blank body line
+
+
+def test_validate_is_the_console_rule_and_nothing_more():
+    """ValidateWonderNews checks only id != 0 [decomp:src/mystery_gift.c:113]."""
+    assert wonder_news.validate(_news())
+    assert not wonder_news.validate(b"\x00\x00" + _news()[2:])
+    assert not wonder_news.validate(_news()[:-1])
+    for bad in (0, 0x10000):
+        try:
+            wonder_news.build_wonder_news(news_id=bad, title="X")
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f"news id {bad} should be rejected")
+
+
+def test_a_ten_line_news_fills_every_body_slot():
+    news = wonder_news.BERRY_NEWS.build()
+    body = wonder_news.parse(news)["body"]
+    assert len(body) == wonder_news.WONDER_NEWS_BODY_TEXT_LINES == 10
+    # A line past index 7 is what arms the console's scroll indicator
+    # [decomp:src/mystery_gift_show_news.c:346].
+    assert body[wonder_news.WONDER_NEWS_VISIBLE_LINES]
+
+
+def test_the_news_beacon_advertises_activity_22_and_the_card_beacon_still_21():
+    profile = configmod.DEFAULT_TRAINER
+    session_id = bytes((0x34, 0x12))
+
+    def activity_of(app_data):
+        record = beacon.b85_decode(app_data[beacon.PIA_HDR:])[:beacon.RECORD_SIZE]
+        word = int.from_bytes(
+            record[beacon.SEARCH_WORD_OFFSET:beacon.SEARCH_WORD_OFFSET + 2], "little")
+        return word & beacon.SEARCH_ACTIVITY_MASK
+
+    news_inactive, news_active = host_beacon.build_wonder_news_app_data(profile, session_id)
+    card_inactive, _card_active = host_beacon.build_wonder_card_app_data(profile, session_id)
+    assert activity_of(news_inactive) == beacon.ACTIVITY_WONDER_NEWS == 22
+    assert activity_of(news_active) == beacon.ACTIVITY_WONDER_NEWS
+    assert activity_of(card_inactive) == beacon.ACTIVITY_WONDER_CARD == 21
+    assert len(news_inactive) == len(card_inactive)
+    assert sum(a != b for a, b in zip(news_inactive, card_inactive)) <= 2
+
+
+def test_the_server_script_is_the_decompiled_news_script():
+    """gMysteryGiftServerScript_SendWonderNews minus SVR_COPY_SAVED_NEWS, which reads a save block
+    we do not have [decomp:src/mystery_gift_scripts.c:174]."""
+    script = mg_server.SCRIPT_SEND_WONDER_NEWS
+    assert [command[0] for command in script] == [
+        mg_server.SVR_LOAD_CLIENT_SCRIPT, mg_server.SVR_SEND, mg_server.SVR_RECV,
+        mg_server.SVR_COPY_GAME_DATA, mg_server.SVR_CHECK_GAME_DATA,
+        mg_server.SVR_GOTO_IF_EQ, mg_server.SVR_GOTO,
+    ]
+    # News carries no flagId: no SVR_CHECK_EXISTING_CARD and no toss prompt.
+    send_news = script[-1][1]
+    assert [command[0] for command in send_news] == [
+        mg_server.SVR_LOAD_CLIENT_SCRIPT, mg_server.SVR_SEND,
+        mg_server.SVR_LOAD_NEWS, mg_server.SVR_SEND,
+        mg_server.SVR_RECV, mg_server.SVR_READ_RESPONSE, mg_server.SVR_GOTO_IF_EQ,
+        mg_server.SVR_LOAD_CLIENT_SCRIPT, mg_server.SVR_SEND,
+        mg_server.SVR_RECV, mg_server.SVR_RETURN,
+    ]
+    assert send_news[4][1] == mg.MG_LINKID_RESPONSE
+    assert send_news[6][1] is True and send_news[6][2] is mg_server._SCRIPT_HAS_NEWS
+    assert send_news[-1][1] == mg_server.SVR_MSG_NEWS_SENT
+
+
+def test_news_reaches_a_console_that_holds_none():
+    news = _news()
+    console = ConsoleClientModel(flag_id=0)
+    engine, _frames = _drive(console, distribution=_distribution(news))
+
+    assert console.result == mg_script.CLI_MSG_NEWS_RECEIVED
+    assert engine.result == mg_server.SVR_MSG_NEWS_SENT and engine.gift_sent
+    assert engine.state == host_mystery_gift.MG_DONE and engine.done
+    assert console.saved_news == news
+    assert console.saved_card is None and console.saved_ram_script is None
+    assert [ident for ident, _payload in console.messages_received] == [
+        mg.MG_LINKID_CLIENT_SCRIPT,     # sClientScript_SendGameData
+        mg.MG_LINKID_CLIENT_SCRIPT,     # sClientScript_SaveNews
+        mg.MG_LINKID_NEWS,
+        mg.MG_LINKID_CLIENT_SCRIPT,     # sClientScript_NewsReceived
+    ]
+
+
+def test_a_console_that_already_holds_the_same_news_keeps_it():
+    """MG_LINKID_RESPONSE TRUE means the console kept what it had: SVR_MSG_HAS_NEWS."""
+    news = _news()
+    console = ConsoleClientModel(flag_id=0, saved_news=news)
+    engine, _frames = _drive(console, distribution=_distribution(news))
+
+    assert console.result == mg_script.CLI_MSG_HAD_NEWS
+    assert engine.result == mg_server.SVR_MSG_HAS_NEWS and not engine.gift_sent
+    assert console.saved_news == news
+
+
+def test_one_changed_byte_makes_the_same_news_new_again():
+    """IsWonderNewsSameAsSaved compares the whole struct [mystery_gift.c:140]; --news-id makes it new."""
+    held = _news()
+    fresh = _news(news_id=wonder_news.PKCAMP_NEWS.news_id + 1)
+    assert fresh != held
+    console = ConsoleClientModel(flag_id=0, saved_news=held)
+    engine, _frames = _drive(console, distribution=_distribution(fresh))
+
+    assert console.result == mg_script.CLI_MSG_NEWS_RECEIVED
+    assert engine.result == mg_server.SVR_MSG_NEWS_SENT
+    assert console.saved_news == fresh
+
+
+def test_the_ten_line_news_survives_the_link_unchanged():
+    news = wonder_news.BERRY_NEWS.build()
+    console = ConsoleClientModel(flag_id=0)
+    engine, _frames = _drive(console, distribution=_distribution(news))
+    assert engine.result == mg_server.SVR_MSG_NEWS_SENT
+    assert console.saved_news == news
+    assert wonder_news.parse(console.saved_news)["body"] == wonder_news.parse(news)["body"]
+
+
+def test_our_own_receive_client_answers_the_same_way_as_the_console_model():
+    """bin/frlg_mg_client.py's CLI_SAVE_NEWS reaches the console model's save-or-keep verdict."""
+    news = _news()
+    client = mg_client.MysteryGiftClientEngine()
+    client.recv_buffer[:] = news.ljust(mg.MG_LINK_BUFFER_SIZE, b"\x00")
+    client.script = mg_script.client_script(mg_script.CLI_SAVE_NEWS)
+
+    client.cmdidx = 0
+    client._run_one()
+    assert client.saved_news == news
+    assert client._pending_send == (mg.MG_LINKID_RESPONSE, (0).to_bytes(4, "little"), 4)
+
+    client.cmdidx = 0
+    client._run_one()
+    assert client.saved_news == news
+    assert client._pending_send == (mg.MG_LINKID_RESPONSE, (1).to_bytes(4, "little"), 4)
+
+    # Id 0 fails ValidateWonderNews and nothing is saved, but the answer is FALSE
+    # [mystery_gift_client.c:210].
+    client.recv_buffer[:] = (b"\x00\x00" + news[2:]).ljust(mg.MG_LINK_BUFFER_SIZE, b"\x00")
+    client.cmdidx = 0
+    client._run_one()
+    assert client.saved_news == news
+    assert client._pending_send == (mg.MG_LINKID_RESPONSE, (0).to_bytes(4, "little"), 4)
+
+
+def test_news_and_card_payloads_cannot_be_mixed():
+    for kwargs in ({"card": b"\x00" * 332}, {"ram_script": b"\x02"}):
+        try:
+            mg_server.MysteryGiftServer(news=_news(), **kwargs)
+        except mg_server.MysteryGiftServerError:
+            pass
+        else:
+            raise AssertionError(f"news + {tuple(kwargs)} should be rejected")
+    try:
+        mg_server.MysteryGiftServer()
+    except mg_server.MysteryGiftServerError:
+        pass
+    else:
+        raise AssertionError("a server with neither a card nor news should be rejected")
+    try:
+        stamp_rally.MysteryGiftDistribution(b"\x00" * 332, b"\x02", news=_news())
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("a distribution with both a card and news should be rejected")
+
+
+def test_the_news_payload_builds_what_the_registry_describes():
+    payload = configmod.WonderNewsPayload()
+    assert payload.news == wonder_news.DEFAULT_NEWS
+    assert payload.build_news() == _news()
+    assert payload.build_distribution().is_news
+    assert configmod.WonderNewsPayload(news_id=77).build_news()[0:2] == (77).to_bytes(2, "little")
+    for bad in ({"news": "nope"}, {"news_id": 0}, {"news_id": 0x10000}):
+        try:
+            configmod.WonderNewsPayload(**bad)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f"{bad} should be rejected")

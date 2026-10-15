@@ -1,0 +1,75 @@
+"""The version-4 connection request, against Sword's serializer `main` 0x017c7aa0 and parser 0x017c62a0."""
+
+import pytest
+
+from pokeldn.ldn import station4 as s4, station_protocol as stp
+
+OUR_MAC = bytes.fromhex("58d8122149a2")
+HOST_MAC = bytes.fromhex("48f1eb209b22")
+HOST_VAR = 0x15D71A64
+
+
+def _location(variable_id=0x11223344):
+    return stp.station_location("169.254.10.2", 12345, stp.ldn_constant_id(OUR_MAC),
+                                variable_id, stp.ldn_service_variable_id(OUR_MAC))
+
+
+def _request(**kw):
+    return s4.build_connection_request(stp.ldn_constant_id(HOST_MAC), HOST_VAR, _location(), **kw)
+
+
+def test_every_field_lands_where_the_serializer_puts_it():
+    r = _request(nat_flags=5, nat_location=1)
+    assert r[0] == s4.CONNECTION_REQUEST == 1
+    assert r[1] == 5                                  # the target's nat flags
+    assert r[2] == s4.PLATFORM_SWITCH == 9            # 5.27-5.45 writes 4 here
+    assert r[3] == 1                                  # a target variable id follows
+    assert int.from_bytes(r[4:12], "big") == stp.ldn_constant_id(HOST_MAC)
+    assert int.from_bytes(r[12:16], "big") == HOST_VAR
+    assert r[16] == 1                                 # the target's nat location
+    assert r[17:] == _location()
+    assert len(r) == 0x11 + 40 == 57
+
+
+def test_it_is_not_a_5_27_request():
+    """The flag byte at [3] shifts everything after it; a version-4 console drops a mismatched
+    constant id in silence."""
+    v4 = _request()
+    v5 = stp.build_connection_request(stp.ldn_constant_id(HOST_MAC), HOST_VAR,
+                                      [stp.FILLER], _location(), player_infos=[], ack_id=1)
+    assert int.from_bytes(v4[4:12], "big") == int.from_bytes(v5[3:11], "big")
+    assert v4[3] != v5[3]                             # v5 has the constant id's first byte here
+    assert v4[2] == 9 and v5[2] == stp.PLATFORM_SWITCH == 4
+
+
+def test_the_relay_variant_is_the_same_message_with_type_6():
+    """One serializer builds both - `csinc` on the caller's flag picks 1 or 6."""
+    a, b = _request(), _request(relay=True)
+    assert a[0] == 1 and b[0] == s4.RELAY_CONNECTION_REQUEST == 6
+    assert a[1:] == b[1:]
+
+
+def test_a_location_of_the_wrong_size_is_refused_here_rather_than_on_the_air():
+    """0x20..0x40, as in 5.27; the parser discards a malformed location's error, so it reads as a
+    refused request."""
+    with pytest.raises(ValueError):
+        s4.build_connection_request(1, 2, b"\0" * 8)
+
+
+def test_a_padded_response_answers_the_gate_byte_from_inside_the_message():
+    """`0x017c6ff0` drops a result-0 response whose byte [0x37] is 5 or more; the 17-byte form ends
+    38 bytes short of it."""
+    short = s4.build_connection_response(0, 0x1122334455667788, 0xAABBCCDD)
+    padded = s4.build_connection_response(0, 0x1122334455667788, 0xAABBCCDD,
+                                          min_size=s4.ACCEPTED_RESPONSE_SIZE)
+    assert len(short) == s4.RESPONSE_SIZE == 0x11
+    assert len(short) <= s4.OFF_RESPONSE_GATE
+    assert len(padded) == 0x38 > s4.OFF_RESPONSE_GATE
+    assert padded[s4.OFF_RESPONSE_GATE] < s4.RESPONSE_GATE_MAX
+    assert padded[:len(short)] == short          # padding changes no field the short form carries
+
+
+def test_the_gate_byte_is_the_only_byte_padding_sets():
+    padded = s4.build_connection_response(0, 1, 2, min_size=0x38, gate=4)
+    assert padded[s4.OFF_RESPONSE_GATE] == 4
+    assert set(padded[s4.RESPONSE_SIZE:s4.OFF_RESPONSE_GATE]) == {0}

@@ -1,0 +1,308 @@
+"""Shared host CLI, Mystery Gift config, and Gate 1 fixture regressions."""
+
+from contextlib import redirect_stderr
+import hashlib
+import io
+import os
+import sys
+from types import SimpleNamespace
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+import frlg_mg_host
+import frlg_trade_host
+from pokeldn import config
+from pokeldn.frlg.gift import gift_registry, mg_script, wonder_card
+from pokeldn.frlg.link import linkplayer
+from pokeldn.frlg.text import charmap
+from pokeldn.frlg.link import beacon
+from pokeldn.ldn import transport
+from pokeldn.frlg.link.host_beacon import build_wonder_card_app_data
+from pokeldn.frlg.gift.host_mg_app import MysteryGiftHostApplication
+from pokeldn.frlg.gift.host_mystery_gift import HostMysteryGiftEngine
+from pokeldn.ldn.host_pia import HostPeerProtocol
+
+
+SESSION_ID = b"\x7b\xf1"
+
+
+def _build_mg(argv):
+    parser = frlg_mg_host.build_parser()
+    return frlg_mg_host.build_run_config(parser, parser.parse_args(argv))
+
+
+def _build_trade(argv):
+    parser = frlg_trade_host.build_parser()
+    return frlg_trade_host.build_run_config(parser, parser.parse_args(argv))
+
+
+def _record(app_data):
+    return beacon.b85_decode(app_data[beacon.PIA_HDR:])[:beacon.RECORD_SIZE]
+
+
+def _sha256(data):
+    return hashlib.sha256(data).hexdigest()
+
+
+def test_flag_validation_is_centralized_in_the_payload():
+    assert config.MysteryGiftPayload(flag_id=1000).receipt_flag == 0x2A7
+    assert config.MysteryGiftPayload(flag_id=1019).receipt_flag == 0x2BA
+    for bad in (999, 1020, -1):
+        try:
+            config.MysteryGiftPayload(flag_id=bad)
+        except ValueError as exc:
+            assert "flagId" in str(exc)
+        else:
+            raise AssertionError(f"invalid flag id accepted: {bad}")
+
+
+def test_gift_help_and_implicit_flag_ids_match_the_registered_catalog():
+    parser = frlg_mg_host.build_parser()
+    help_text = parser.format_help()
+    for slug in gift_registry.GIFT_REGISTRY.live_choices:
+        entry = gift_registry.GIFT_REGISTRY.entry(slug)
+        assert slug in help_text
+        assert f"flag ID {entry.default_flag_id}: {entry.description}" in help_text
+
+        run = frlg_mg_host.build_run_config(
+            parser, parser.parse_args(["--live", "--gift", slug]))
+        assert run.payload.flag_id == entry.default_flag_id
+        card = gift_registry.GIFT_REGISTRY.build_distribution(slug).card
+        assert int.from_bytes(card[4:8], "little") == entry.default_flag_id % 100
+
+    override = frlg_mg_host.build_run_config(
+        parser, parser.parse_args([
+            "--live", "--gift", "porygon-tm-gift", "--flag-id", "1012"]))
+    assert override.payload.flag_id == 1012
+    card = gift_registry.GIFT_REGISTRY.build_distribution(
+        "porygon-tm-gift", flag_id=1012).card
+    assert int.from_bytes(card[4:8], "little") == 12
+
+
+def test_mystery_gift_client_ready_idle_frame_override_is_diagnostic_only():
+    run = _build_mg(["--live", "--client-ready-idle-frames", "45"])
+    assert run.client_ready_idle_frames == 45
+
+    for bad_value in (-1, 601, True, "45"):
+        try:
+            config.MysteryGiftRunConfig(client_ready_idle_frames=bad_value)
+        except ValueError as exc:
+            assert "client_ready_idle_frames" in str(exc)
+        else:
+            raise AssertionError(f"invalid timing override accepted: {bad_value!r}")
+
+    for bad in ("-1", "601", "soon"):
+        parser = frlg_mg_host.build_parser()
+        with redirect_stderr(io.StringIO()):
+            try:
+                parser.parse_args(["--live", "--client-ready-idle-frames", bad])
+            except SystemExit as exc:
+                assert exc.code == 2
+            else:
+                raise AssertionError(f"invalid timing override accepted: {bad}")
+
+
+def test_mystery_gift_host_lifecycle_options_are_explicit_and_validated():
+    run = _build_mg([
+        "--live", "--end-on-success", "--idle-timeout", "300",
+        "--attempt-log-dir", "logs",
+    ])
+    assert run.end_on_success is True
+    assert run.idle_timeout_seconds == 300
+    assert run.attempt_log_dir == "logs"
+
+    for bad in (0, -1, 86401, True, "300"):
+        try:
+            config.MysteryGiftRunConfig(idle_timeout_seconds=bad)
+        except ValueError as exc:
+            assert "idle_timeout_seconds" in str(exc)
+        else:
+            raise AssertionError(f"invalid idle timeout accepted: {bad!r}")
+
+
+def test_mystery_gift_main_returns_distinct_supervisor_outcomes(monkeypatch):
+    original_app = frlg_mg_host.MysteryGiftHostApplication
+
+    class FakeApplication:
+        delivered = False
+        interrupted = False
+        idle = False
+
+        def __init__(self, *_args, **_kwargs):
+            self.delivery_succeeded = self.delivered
+            self.interrupted = self.interrupted
+            self.idle_timed_out = self.idle
+
+        def run(self):
+            return self.delivery_succeeded
+
+    try:
+        frlg_mg_host.MysteryGiftHostApplication = FakeApplication
+        monkeypatch.setattr(frlg_mg_host.os, "geteuid", lambda: 0, raising=False)
+        FakeApplication.delivered, FakeApplication.idle, FakeApplication.interrupted = True, False, False
+        assert frlg_mg_host.main(["--live"]) == 0
+        FakeApplication.delivered, FakeApplication.idle, FakeApplication.interrupted = False, False, False
+        assert frlg_mg_host.main(["--live"]) == 1
+        FakeApplication.idle = True
+        assert frlg_mg_host.main(["--live"]) == 124
+        FakeApplication.idle, FakeApplication.interrupted = False, True
+        assert frlg_mg_host.main(["--live"]) == 130
+    finally:
+        frlg_mg_host.MysteryGiftHostApplication = original_app
+
+
+def test_both_host_clis_use_the_same_explicit_transport_parsing():
+    common = [
+        "--live", "--ot", "MGHOST", "--version", "firered",
+        "--id=12345:34567", "--password", "a1b2", "--phy", "phy7",
+        "--keys", "/keys", "--comm-id", "01006fa0233f8000",
+        "--capture", "trace.jsonl", "--channel", "6", "--scene", "1234",
+        "--max-participants", "7", "--skip-preflight", "--skip-encryption",
+        "--accept-decrypted-ccmp",
+        "--native-nonce-sequence", "--session-response-first",
+    ]
+    gift = _build_mg(common)
+    trade = _build_trade(common + ["one.pk3", "two.pk3"])
+    assert gift.profile == trade.profile
+    assert gift.ldn == trade.ldn
+    assert gift.role == trade.role
+    assert gift.role.accept_decrypted_ccmp is True
+    assert gift.profile.trainer_id == (34567 << 16) | 12345
+
+
+def test_shared_host_parser_rejects_bad_hex_values():
+    for argv in (["--live", "--password", "xyz"],
+                 ["--live", "--comm-id", "not-hex"]):
+        parser = frlg_mg_host.build_parser()
+        args = parser.parse_args(argv)
+        try:
+            with redirect_stderr(io.StringIO()):
+                frlg_mg_host.build_run_config(parser, args)
+        except SystemExit as exc:
+            assert exc.code == 2
+        else:
+            raise AssertionError(f"invalid host option accepted: {argv}")
+
+
+def test_overridden_profile_reaches_every_host_identity_surface():
+    run = _build_mg([
+        "--live", "--ot", "MGHOST", "--version", "firered",
+        "--id=12345:34567", "--flag-id", "1004",
+    ])
+    profile = run.profile
+    assert profile.trainer_id == (34567 << 16) | 12345
+    assert profile.progress_flags == 0x11
+
+    inactive, _active = build_wonder_card_app_data(profile, SESSION_ID)
+    record = _record(inactive)
+    search_word = int.from_bytes(
+        record[beacon.SEARCH_WORD_OFFSET:beacon.SEARCH_WORD_OFFSET + 2], "little")
+    assert int.from_bytes(record[0:2], "little") == profile.tid
+    assert record[2:10] == charmap.encode(
+        profile.name, width=8, pad=0xFF)
+    assert ((search_word & beacon.SEARCH_VERSION_MASK)
+            >> beacon.SEARCH_VERSION_SHIFT) == (linkplayer.VERSION_FIRE_RED & 0x7)
+    assert ((search_word & beacon.SEARCH_LANGUAGE_MASK)
+            >> beacon.SEARCH_LANGUAGE_SHIFT) == linkplayer.LANGUAGE_ENGLISH
+    assert beacon.decode_pia_header(inactive)["nickname"] == profile.name
+
+    rfu_game_data = profile.build_rfu_game_data(
+        beacon.ACTIVITY_WONDER_CARD, started=False)
+    assert int.from_bytes(rfu_game_data[4:6], "little") == profile.tid
+    assert rfu_game_data[17:26] == charmap.encode(
+        profile.name, width=9, pad=0x00)
+
+    card, script = run.payload.build()
+    engine = HostMysteryGiftEngine(
+        card, script, link_player=profile.to_link_player())
+    assert engine.lp.name == profile.name
+    assert engine.lp.trainer_id == profile.trainer_id
+    assert engine.lp.progress_flags == engine.lp.progress_flags_copy == 0x11
+    assert engine._link_player_block[16:44] == profile.to_link_player().pack(
+        name_pad=linkplayer.HOST_NAME_PAD)
+
+    peer = HostPeerProtocol(
+        SimpleNamespace(), profile, SimpleNamespace(), inactive)
+    assert peer.profile.session_name == profile.name
+
+    logs = []
+    app = MysteryGiftHostApplication.__new__(MysteryGiftHostApplication)
+    app.config = run
+    app.profile = profile
+    app.session = SimpleNamespace(rfu=SimpleNamespace(host_session_id=SESSION_ID))
+    app.card, app.ram_script, app.info = card, script, logs.append
+    app._log_identity(profile.to_link_player())
+    assert any("OT='MGHOST'" in line for line in logs)
+    assert any("TID=0x3039" in line and "SID=0x8707" in line for line in logs)
+    assert any("flagId 1004" in line for line in logs)
+
+
+def test_gate_1_legacy_serialized_fixtures_are_byte_identical():
+    card, script = wonder_card.build_default_gift()
+    inactive, active = build_wonder_card_app_data(config.DEFAULT_TRAINER, SESSION_ID)
+    assert (len(card), _sha256(card)) == (
+        332, "1afdef737ebf3be077e6cf19d9f85a90d6bdba97e434c0784cdad967a8550025")
+    assert (len(script), _sha256(script)) == (
+        251, "e8d48201cbffea57bba27e65fa91464da0949e5f8fb0e230424ea7661c898a33")
+    assert _sha256(inactive) == "20c2ef2c91edba901398d032e0bb1283e4ed6e941ca5350bba55b8e32c901a61"
+    assert _sha256(active) == "406f45e17719e069e820c3751ee2dd1aaf18125895cf8c9112ba7e7a79330f19"
+    assert _sha256(mg_script.CLIENT_SCRIPT_SEND_GAME_DATA) \
+        == "9ae8de594f9c19e473ace3b34816f337fea3e60f9c9ac64cfb37d87b610d50de"
+    assert _sha256(mg_script.CLIENT_SCRIPT_SAVE_CARD) \
+        == "64a123dc7732ae4ee506aaa55154e36b563e0af4d68d67f3c152fa5739c5176e"
+
+
+
+def test_hunt_criteria_reach_the_card_and_belong_only_to_the_hunt(capsys):
+    """--hunt-* compose another card for rng-mon-hunt [asm/field/mon-seek.s]; without them the
+    registered card goes byte for byte."""
+    from pokeldn.frlg.gift import wonder_card_events
+    from pokeldn.frlg.rom import native_script
+
+    plain = _build_mg(["--live", "--gift", wonder_card_events.GIFT_RNG_MON_HUNT])
+    assert plain.payload.definition is None
+    assert plain.payload.build_distribution().mevent == \
+        gift_registry.GIFT_REGISTRY.build_distribution(
+            wonder_card_events.GIFT_RNG_MON_HUNT).mevent
+
+    chosen = _build_mg(["--live", "--gift", wonder_card_events.GIFT_RNG_MON_HUNT,
+                        "--hunt-nature", "adamant", "--hunt-iv", "attack=16"])
+    assert chosen.payload.definition.slug == wonder_card_events.GIFT_RNG_MON_HUNT
+    assert chosen.payload.definition.mevent == wonder_card_events.build_rng_mon_hunt_gift(
+        native_script.MonCriteria(natures=(3,), iv_minimums=(0, 16, 0, 0, 0, 0))).mevent
+    chosen_distribution = chosen.payload.build_distribution()
+    plain_distribution = plain.payload.build_distribution()
+    assert chosen_distribution.mevent != plain_distribution.mevent
+    assert chosen_distribution.card == plain_distribution.card
+    assert chosen_distribution.ram_script == plain_distribution.ram_script
+    printed = capsys.readouterr().out
+    assert "shiny, Adamant, attack >= 16" in printed and "overworld stops" in printed
+
+    for argv in (["--live", "--gift", "celebi", "--hunt-nature", "adamant"],
+                 ["--live", "--news", "--hunt-iv", "speed=20"],
+                 ["--live", "--buffer-script", "--hunt-cap", "1000"]):
+        parser = frlg_mg_host.build_parser()
+        with redirect_stderr(io.StringIO()) as err:
+            try:
+                frlg_mg_host.build_run_config(parser, parser.parse_args(argv))
+            except SystemExit:
+                pass
+            else:
+                raise AssertionError(f"{argv} should not have built a run")
+        assert "--hunt-" in err.getvalue()
+
+
+def test_a_hunt_too_slow_to_run_is_refused_on_the_command_line():
+    """The stub searches with the field engine stopped; a search that could outlast the ceiling is refused."""
+    from pokeldn.frlg.gift import wonder_card_events
+    parser = frlg_mg_host.build_parser()
+    with redirect_stderr(io.StringIO()) as err:
+        try:
+            frlg_mg_host.build_run_config(parser, parser.parse_args(
+                ["--live", "--gift", wonder_card_events.GIFT_RNG_MON_HUNT,
+                 "--hunt-nature", "jolly", "--hunt-iv", "speed=31"]))
+        except SystemExit:
+            pass
+        else:
+            raise AssertionError("a 6.5-million-state search should have been refused")
+    assert "ceiling" in err.getvalue()

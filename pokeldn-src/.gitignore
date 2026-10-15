@@ -1,0 +1,96 @@
+# Ignore every top-level folder, then allow back the published ones. This keeps
+# scratchpad/, .venv/, captures and notes out of the repository by default.
+/*/
+!/pokeldn/
+!/bin/
+!/tests/
+!/tools/
+!/docs/
+!/scripts/
+# ARM sources for CLI_RUN_BUFFER_SCRIPT payloads; the assembled bytes are committed in
+# pokeldn/frlg/rom/buffer_payloads.py and these are what they must still assemble to.
+!/asm/
+!/config/
+# README banner and other repository assets.
+!/.github/
+# ESP32 radio firmware sources; the ESP-IDF build output stays local.
+!/firmware/
+# The desktop app.
+!/gui/
+!/services/
+/firmware/**/build/
+/firmware/**/sdkconfig
+/firmware/**/sdkconfig.old
+/firmware/**/dependencies.lock
+/firmware/**/managed_components/
+!/config/host.toml
+
+# Machine-specific host settings can name local key locations and capture
+# directories.  Keep them out of the deployable repository.
+/config/host.local.toml
+!/vendor/
+!/vendor/**
+
+# Never publish Pokemon data files (live-trade outputs can carry trainer/account
+# identifiers); covers any stray .pk3/.ek3 at the root or inside pokeldn/ too.
+*.pk3
+*.ek3
+*.pb7
+*.pk8
+*.pb8
+*.pa8
+*.pk9
+*.pa9
+*.wc8
+
+# Nintendo Switch key material is machine-local.  This includes the normal
+# ~/.switch/prod.keys location when it is copied into the project by mistake.
+prod.keys
+*.keys
+.switch/
+
+# Python bytecode (applies inside pokeldn/ as well)
+__pycache__/
+*.pyc
+
+# Editable installs of the vendored LDN package create local packaging
+# metadata beside setup.py. It is reproducible and must not block Pi updates.
+*.egg-info/
+
+# Runtime logs, protocol traces, and packet captures may contain console,
+# trainer, or network identifiers and should stay local.
+*.log
+*.jsonl
+*.pcap
+*.pcapng
+*.trace
+*_net_facts.json
+*.payload*.bin
+*.wc8.frag*
+host-tap-*.txt
+logs/
+# Nested standalone clone (kinnay/LDN), a reference copy of the vendored package.
+/LDN/
+
+# Saves and ROM for testing wonder cards on emulation.
+pokeldn/POKEMON_FIRE_BPRE01.gba
+pokeldn/POKEMON_FIRE_BPRE01.sav.gift.sav
+pokeldn/POKEMON_FIRE_BPRE01.sav
+
+# Untracked working notes.
+CLAUDE.md
+NOTES.history.local.md
+NOTES.local.md
+REFERENCES.local.md
+
+# MacOS
+.DS_Store
+EVAL_RUN_NOTES.txt
+
+# Build output of the app: the PKHeX service and the bundled firmware image.
+/services/pkhex/bin/
+/services/pkhex/obj/
+/services/pkhex/dist/
+/gui/firmware/
+/dist/
+/*.spec

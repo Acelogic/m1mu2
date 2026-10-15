@@ -1,0 +1,104 @@
+"""Pia's Local Protocol (36): the update session a BDSP host rebroadcasts every 100 ms until acked.
+Byte order is mixed: the message header big-endian, the protocol's fields little-endian, a local address big-endian."""
+
+import struct
+
+import pytest
+
+from pokeldn.ldn import local_protocol as lp
+
+
+def _address(ip, port):
+    """A local address the way the wire holds it: IPv4 then port, BIG-endian, then 2 bytes."""
+    return bytes(int(p) for p in ip.split(".")) + struct.pack(">H", port) + b"\0\0"
+
+
+def _update_session(seq=4, network_id=0x223B4A8B, host_var=0x11BAC90D, host_svc=0x597BC2A3,
+                    constant_id=b"\x00\x00\xAA\xBB\xCC\xDD\xEE\xFF", allow=True, seats=()):
+    nodes = b""
+    for i in range(lp.NODE_COUNT):
+        if i < len(seats):
+            ip, port, rank = seats[i]
+            nodes += _address(ip, port) + bytes([rank])
+        else:
+            nodes += b"\0" * 8 + bytes([lp.RANKING_EMPTY])
+    payload = nodes + b"\x00"                       # + host migration state
+    head = struct.pack("<BBH", 1, lp.UPDATE_SESSION, len(payload)) + b"\0" * 6 + b"\0" * 2
+    body = (struct.pack("<4I", seq, network_id, host_var, host_svc) + b"\0" * 4
+            + constant_id + bytes([1 if allow else 0]) + b"\0" * 7)
+    return head + body + payload
+
+
+SEATS = (("169.254.54.1", 12345, 0), ("169.254.54.2", 12345, 1))
+
+
+def test_an_update_session_parses_to_the_room_it_describes():
+    u = lp.parse_update_session(_update_session(seats=SEATS))
+    assert u.sequence_id == 4
+    assert u.network_id == 0x223B4A8B
+    assert u.host_variable_id == 0x11BAC90D
+    assert u.allow_participating is True
+    assert u.host_migration_state == 0
+
+
+def test_the_seats_read_back_with_their_addresses_and_ranking():
+    u = lp.parse_update_session(_update_session(seats=SEATS))
+    assert len(u.nodes) == 8
+    assert (u.nodes[0].ip, u.nodes[0].port, u.nodes[0].ranking) == ("169.254.54.1", 12345, 0)
+    assert (u.nodes[1].ip, u.nodes[1].port, u.nodes[1].ranking) == ("169.254.54.2", 12345, 1)
+    assert [n.ip for n in u.nodes[2:]] == ["0.0.0.0"] * 6
+
+
+def test_an_empty_seat_is_ranking_255_and_is_not_counted_as_occupied():
+    u = lp.parse_update_session(_update_session(seats=SEATS))
+    assert all(n.ranking == lp.RANKING_EMPTY for n in u.nodes[2:])
+    assert all(not n.occupied for n in u.nodes[2:])
+    assert len(u.occupied) == 2
+
+
+def test_a_bad_version_byte_is_refused():
+    raw = bytearray(_update_session(seats=SEATS))
+    raw[0] = 2
+    with pytest.raises(ValueError, match="version"):
+        lp.parse_update_session(bytes(raw))
+
+
+def test_the_wrong_message_type_is_refused_rather_than_misread():
+    raw = bytearray(_update_session(seats=SEATS))
+    raw[1] = lp.DESTROY_NETWORK
+    with pytest.raises(ValueError, match="message type"):
+        lp.parse_update_session(bytes(raw))
+
+
+def test_a_truncated_message_is_refused():
+    raw = _update_session(seats=SEATS)
+    with pytest.raises(ValueError, match="truncated"):
+        lp.parse_update_session(raw[:-20])
+    with pytest.raises(ValueError, match="header"):
+        lp.parse_update_session(raw[:8])
+
+
+def test_the_ack_refuses_to_parse_an_update_session():
+    with pytest.raises(ValueError, match="message type"):
+        lp.parse_ack(_update_session(seats=SEATS))
+
+
+def test_the_ack_carries_no_payload_size_the_way_the_console_writes_it():
+    """main.bin 0x016bc0c8 writes 0x14 as a word at +0x14, so the size halfword at +0x16 is zero."""
+    ack = lp.build_ack(4)
+    assert len(ack) == 20
+    assert ack[0] == 1 and ack[1] == lp.UPDATE_SESSION_ACK
+    assert struct.unpack_from("<H", ack, 2)[0] == 0
+    assert ack[4:12] == b"\0" * 8
+    assert ack[12:20] == struct.pack("<I", 4) + b"\0" * 4
+
+
+def test_an_ack_is_framed_exactly_like_the_update_session_it_answers():
+    """One send path in LocalProtocol means one framing: flags 0x11, destination 0, protocol 36."""
+    from pokeldn.ldn.pia5 import build_message, parse_messages
+    body = build_message(lp.build_ack(9), protocol=lp.PROTOCOL,
+                         message_flags=lp.MESSAGE_FLAGS, destination=lp.BROADCAST)
+    assert body[:16] == bytes.fromhex("7f110014240000000000000000000000")
+    m = parse_messages(body)
+    assert len(m) == 1 and m[0].message_flags == 0x11 and m[0].destination == 0
+    assert lp.parse_ack(m[0].payload) == 9

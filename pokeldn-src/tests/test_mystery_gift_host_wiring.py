@@ -1,0 +1,231 @@
+"""Wiring for the Mystery Gift host: advertisement, config, session seam.
+
+Run standalone (no pytest needed):   python tests/test_mystery_gift_host_wiring.py
+"""
+
+import os
+import sys
+import pytest
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from pokeldn.frlg.gift import gift_composer, wonder_card  # noqa: E402
+from pokeldn.frlg.text import charmap  # noqa: E402
+from pokeldn.frlg.link import beacon
+from pokeldn.ldn import crypto, pia_connect, reliable, transport  # noqa: E402
+from pokeldn.frlg.link.host_beacon import (  # noqa: E402
+    build_trade_app_data, build_wonder_card_app_data,
+)
+from pokeldn.frlg.gift.host_mg_app import (  # noqa: E402
+    MysteryGiftHostApplication, MysteryGiftRunConfig,
+)
+from pokeldn.frlg.gift.host_mystery_gift import HostMysteryGiftEngine  # noqa: E402
+from pokeldn.config import (  # noqa: E402
+    DEFAULT_TRAINER, HostOptions, LdnConfig, MysteryGiftPayload,
+)
+from pokeldn.frlg.link.host_session import HostSession  # noqa: E402
+
+SESSION_ID = b"\x7b\xf1"
+
+
+def _record(app_data):
+    return beacon.b85_decode(app_data[beacon.PIA_HDR:])[:beacon.RECORD_SIZE]
+
+
+def _search_word(app_data):
+    record = _record(app_data)
+    return int.from_bytes(
+        record[beacon.SEARCH_WORD_OFFSET:beacon.SEARCH_WORD_OFFSET + 2], "little")
+
+
+def test_wonder_card_advertisement_matches_the_proven_friend_control():
+    """The ``friend_control`` record ``...9515...`` was listed and joined by a real console
+    (docs/frlg_gift.md)."""
+    inactive, _active = build_wonder_card_app_data(DEFAULT_TRAINER, SESSION_ID)
+    record = _record(inactive)
+    assert record.hex() == "2288cadfbdd5e1e4ffff7bf1000000009515000000000000"
+
+
+def test_advertisement_declares_activity_wonder_card_and_is_joinable():
+    inactive, active = build_wonder_card_app_data(DEFAULT_TRAINER, SESSION_ID)
+    word = _search_word(inactive)
+    assert word & beacon.SEARCH_ACTIVITY_MASK == beacon.ACTIVITY_WONDER_CARD == 21
+    # union_room.c:2313 refuses a candidate whose startedActivity bit is set.
+    assert not word & beacon.SEARCH_STARTED_ACTIVITY
+    assert _search_word(active) & beacon.SEARCH_STARTED_ACTIVITY
+    # SetHostRfuWonderFlags(FALSE, FALSE) [union_room.c:2052]: no wonder flags.
+    assert not word & beacon.SEARCH_HAS_CARD
+
+
+def test_advertisement_preserves_every_unexplained_captured_byte():
+    """Only the activity changes relative to the trade beacon; version, language,
+    the unexplained search bit 7 and both unexplained regions are untouched."""
+    gift, _ = build_wonder_card_app_data(DEFAULT_TRAINER, SESSION_ID)
+    trade, _ = build_trade_app_data(DEFAULT_TRAINER, SESSION_ID)
+    assert gift[:beacon.PIA_HDR] == trade[:beacon.PIA_HDR]
+    gift_record, trade_record = _record(gift), _record(trade)
+    differing = [i for i in range(beacon.RECORD_SIZE)
+                 if gift_record[i] != trade_record[i]]
+    assert differing == [beacon.SEARCH_WORD_OFFSET]
+    high = _search_word(gift) & ~beacon.SEARCH_ACTIVITY_MASK
+    assert high == _search_word(trade) & ~beacon.SEARCH_ACTIVITY_MASK
+    assert high & beacon.SEARCH_UNKNOWN_BIT7
+
+
+def test_trade_advertisement_is_unchanged_by_the_gift_host():
+    """The trade host is proven on hardware and must stay bit-identical."""
+    inactive, _active = build_trade_app_data(DEFAULT_TRAINER, SESSION_ID)
+    record = _record(inactive)
+    assert record.hex() == "2288cadfbdd5e1e4ffff7bf1000000008415000000000000"
+    assert record[beacon.SEARCH_WORD_OFFSET] & beacon.SEARCH_ACTIVITY_MASK \
+        == beacon.ACTIVITY_TRADE
+
+
+def test_default_config_selects_the_self_contained_celebi_gift():
+    config = MysteryGiftRunConfig()
+    assert config.payload.gift == wonder_card.GIFT_CELEBI
+    assert config.payload.flag_id == 1003
+    assert config.role.skip_encryption is True
+    assert config.role.accept_decrypted_ccmp is False
+    assert config.role.native_nonce_sequence is True
+    assert config.role.session_response_first is True
+    assert config.payload.receipt_flag == 0x2AA
+    app = MysteryGiftHostApplication.__new__(MysteryGiftHostApplication)
+    app.config = config
+    card, script = app._build_payload()
+    assert charmap.decode(card[10:50]).startswith("CELEBI GIFT")
+    assert int.from_bytes(card[2:4], "little") == wonder_card.SPECIES_CELEBI
+    assert int.from_bytes(card[4:8], "little") == 3
+    assert charmap.decode(card[250:290]).endswith("MercuryEnigma")
+    assert 0 < len(script) <= gift_composer.MAX_RAM_SCRIPT_SIZE
+    assert script != wonder_card.build_delivery_ram_script(item=None, flag_id=1003)
+
+
+def test_client_ready_idle_frame_override_reaches_the_engine():
+    seen = {}
+
+    class FakeTransport:
+        def __init__(self, **kwargs):
+            seen["transport"] = kwargs
+
+    run = MysteryGiftRunConfig(
+        ldn=LdnConfig(phy="phy7", keys_path=__file__),
+        client_ready_idle_frames=45)
+    app = MysteryGiftHostApplication(
+        run, transport_factory=FakeTransport, log=lambda *_args: None)
+    app._build_components()
+
+    engine = app.session.activity
+    assert engine.timing.client_ready_idle_frames == 45
+    assert engine.timing.inter_block_gap_frames == 36
+    assert seen["transport"]["phyname"] == "phy7"
+
+
+def test_max_participants_matches_the_trade_host():
+    """``max_participants`` sizes the Net 0x11 station array [pia_connect.build_net_conn_request]; 2
+    left the console silent."""
+    trade_default = HostOptions().max_participants
+    assert MysteryGiftRunConfig().role.max_participants == trade_default == 6
+
+    def net_flags(max_stations):
+        net = pia_connect.build_net_conn_request(
+            2, 0, b"\x00" * 6, 0, ["169.254.1.1", "169.254.1.2"], max_stations=max_stations)
+        body = crypto.compress(reliable.build_message(pia_connect.PROTO_NET, net))
+        return ((-len(body)) % 16) << 4 | 0x03
+
+    # The station array length lands in the header's pad nibble.
+    assert net_flags(2) != net_flags(6)
+
+
+def test_config_rejects_a_flag_id_outside_the_receipt_flag_table():
+    """flagId maps into sReceivedGiftFlags[20] [mystery_gift.c:30]; outside that
+    range the console's card would have no receipt flag to set."""
+    for bad in (999, 1020, 0):
+        try:
+            MysteryGiftPayload(flag_id=bad)
+        except ValueError:
+            continue
+        raise AssertionError(f"flag_id {bad} should be rejected")
+
+
+def test_session_accepts_a_mystery_gift_engine_in_place_of_a_party():
+    card, ram_script = wonder_card.build_default_gift()
+    engine = HostMysteryGiftEngine(card, ram_script)
+    session = HostSession(engine=engine)
+    assert session.activity is engine
+    assert session.trade is engine
+    assert session.reliable is not None and session.rfu is not None
+
+
+def test_session_requires_an_activity():
+    try:
+        HostSession()
+    except ValueError:
+        return
+    raise AssertionError("HostSession with neither a party nor an engine must fail")
+
+
+def test_the_engine_cannot_declare_the_close_before_the_handshake():
+    card, ram_script = wonder_card.build_default_gift()
+    engine = HostMysteryGiftEngine(card, ram_script)
+    assert engine.disconnect_requested is False and engine.done is False
+    # mark_disconnect_sent must not be able to declare success early.
+    try:
+        engine.mark_disconnect_sent()
+    except RuntimeError:
+        return
+    raise AssertionError("mark_disconnect_sent before the close handshake must fail")
+
+
+def _console_game_data(version_code):
+    """The console's MysteryGiftLinkGameData with the version nibble set."""
+    from pokeldn.frlg.gift import mg_script
+    raw = bytearray(0x64)
+    raw[0x00:0x04] = int(mg_script.LINK_GAME_DATA_MAGIC).to_bytes(4, "little") \
+        if hasattr(mg_script, "LINK_GAME_DATA_MAGIC") else b"\x00" * 4
+    raw[0x10:0x14] = int(version_code).to_bytes(4, "little")
+    raw[0x44] = 7
+    raw[0x45:0x4C] = b"\xff" * 7
+    raw[0x5C:0x60] = b"BPRF"
+    raw[0x60] = 0x0A
+    return mg_script.parse_link_game_data(bytes(raw))
+
+
+def test_a_run_aimed_at_the_other_cartridge_is_refused_before_anything_is_sent():
+    from pokeldn.frlg.gift import mg_script, mg_server
+    card, ram_script = wonder_card.build_default_gift()
+    server = mg_server.MysteryGiftServer(card, ram_script, expect_console="leafgreen")
+    server.game_data = _console_game_data(mg_script.VERSION_CODE_FIRERED)
+
+    with pytest.raises(mg_server.MysteryGiftServerError, match="THIS RUN IS FOR LEAFGREEN"):
+        server._check_expected_console()
+    assert server.console_mismatch == ("leafgreen", "firered")
+
+
+def test_the_right_cartridge_passes_and_no_expectation_passes_anything():
+    from pokeldn.frlg.gift import mg_script, mg_server
+    card, ram_script = wonder_card.build_default_gift()
+    for expected, code in (("firered", mg_script.VERSION_CODE_FIRERED),
+                           ("leafgreen", mg_script.VERSION_CODE_LEAFGREEN),
+                           (None, mg_script.VERSION_CODE_FIRERED)):
+        server = mg_server.MysteryGiftServer(card, ram_script, expect_console=expected)
+        server.game_data = _console_game_data(code)
+        server._check_expected_console()
+        assert server.console_mismatch is None
+
+
+def test_the_expectation_has_to_name_a_cartridge():
+    from pokeldn.frlg.gift import mg_server
+    card, ram_script = wonder_card.build_default_gift()
+    with pytest.raises(mg_server.MysteryGiftServerError):
+        mg_server.MysteryGiftServer(card, ram_script, expect_console="emerald")
+
+
+def test_the_cli_passes_the_expectation_through_to_the_engine():
+    import frlg_mg_host
+    parser = frlg_mg_host.build_parser()
+    config = frlg_mg_host.build_run_config(
+        parser, parser.parse_args(["--buffer-script", "--expect-console", "leafgreen"]))
+
+    assert config.expect_console == "leafgreen"
+

@@ -1,0 +1,1023 @@
+"""Mystery Gift distributor against ConsoleClientModel, a console written from the decomp.
+
+Run standalone (no pytest needed):   python tests/test_mystery_gift_flow.py
+"""
+
+import os
+import sys
+
+import pytest
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from pokeldn.frlg.gift import ereader_trainer, host_mystery_gift, mg_link, mg_script, mg_server, wonder_card, wonder_news  # noqa: E402
+from pokeldn.frlg.link import linkplayer, trade  # noqa: E402
+from pokeldn.frlg.rom import buffer_script  # noqa: E402
+from pokeldn.frlg.text import charmap  # noqa: E402
+from pokeldn.gba import block, rfu, rfu_leader  # noqa: E402
+from pokeldn.frlg.gift import mystery_gift as mg  # noqa: E402
+
+
+def test_chunking_matches_mgl_send_walk():
+    """MGL_Send sends 252 while >252 remain; an exact multiple ends on a full chunk."""
+    assert [len(c) for c in mg_link.chunk_payload(b"\x00" * 252)] == [252]
+    assert [len(c) for c in mg_link.chunk_payload(b"\x00" * 504)] == [252, 252]
+    assert [len(c) for c in mg_link.chunk_payload(b"\x00" * 332)] == [252, 80]
+
+
+def test_receiver_faults_exactly_where_the_console_calls_fatal_error():
+    good = mg_link.build_message(mg.MG_LINKID_CARD, b"abcd")
+
+    receiver = mg_link.MysteryGiftLinkReceiver()
+    receiver.expect(mg.MG_LINKID_NEWS)                       # wrong ident
+    try:
+        receiver.feed_block(good[0])
+    except mg_link.MysteryGiftLinkError:
+        pass
+    else:
+        raise AssertionError("ident mismatch must fault")
+
+    receiver = mg_link.MysteryGiftLinkReceiver()
+    receiver.expect(mg.MG_LINKID_CARD)                       # size > buffer
+    try:
+        receiver.feed_block(mg_link.build_header(mg.MG_LINKID_CARD, 0, 0x401))
+    except mg_link.MysteryGiftLinkError:
+        pass
+    else:
+        raise AssertionError("oversized message must fault")
+
+    receiver = mg_link.MysteryGiftLinkReceiver()
+    receiver.expect(mg.MG_LINKID_CARD)                       # corrupt payload
+    receiver.feed_block(good[0])
+    try:
+        receiver.feed_block(b"\x00" * 4)
+    except mg_link.MysteryGiftLinkError:
+        pass
+    else:
+        raise AssertionError("CRC mismatch must fault")
+
+
+def test_client_scripts_match_the_decomp_arrays():
+    """Byte-for-byte against src/mystery_gift_scripts.c, 8 bytes per command."""
+    assert mg_script.CLIENT_SCRIPT_INIT == mg_script.client_script(
+        (mg_script.CLI_RECV, mg.MG_LINKID_CLIENT_SCRIPT), mg_script.CLI_COPY_RECV)
+    assert len(mg_script.CLIENT_SCRIPT_SEND_GAME_DATA) == 4 * mg_script.CLIENT_CMD_SIZE
+    assert len(mg_script.CLIENT_SCRIPT_SAVE_CARD) == 6 * mg_script.CLIENT_CMD_SIZE
+    # sClientScript_SaveCard: RECV CARD, SAVE_CARD, RECV RAM_SCRIPT, SAVE_RAM_SCRIPT,
+    # SEND_READY_END, RETURN CLI_MSG_CARD_RECEIVED [mystery_gift_scripts.c:42].
+    words = [int.from_bytes(mg_script.CLIENT_SCRIPT_SAVE_CARD[i:i + 4], "little")
+             for i in range(0, len(mg_script.CLIENT_SCRIPT_SAVE_CARD), 4)]
+    assert words == [
+        mg_script.CLI_RECV, mg.MG_LINKID_CARD,
+        mg_script.CLI_SAVE_CARD, 0,
+        mg_script.CLI_RECV, mg.MG_LINKID_RAM_SCRIPT,
+        mg_script.CLI_SAVE_RAM_SCRIPT, 0,
+        mg_script.CLI_SEND_READY_END, 0,
+        mg_script.CLI_RETURN, mg_script.CLI_MSG_CARD_RECEIVED,
+    ]
+
+
+def test_every_client_script_terminates_execution():
+    """CopyRecvScript copies the whole 1024-byte buffer; a script running off its end executes stale bytes."""
+    stoppers = (mg_script.CLI_RETURN, mg_script.CLI_COPY_RECV,
+                mg_script.CLI_COPY_RECV_IF, mg_script.CLI_COPY_RECV_IF_N)
+    for name in dir(mg_script):
+        if not name.startswith("CLIENT_SCRIPT_"):
+            continue
+        script = getattr(mg_script, name)
+        last = int.from_bytes(script[-mg_script.CLIENT_CMD_SIZE:][:4], "little")
+        assert last in stoppers, f"{name} ends with instruction {last}"
+
+
+CONSOLE_TRAINER_ID = 0x47ED8822
+
+
+def _game_data(flag_id=0, version_code=mg.VERSION_CODE_FIRERED,
+               magic=mg.GAME_DATA_VALID_VAR, *, max_stamps=0,
+               metadata_icon=0, stamps=(), trainer_id=CONSOLE_TRAINER_ID):
+    """Build what MysteryGift_LoadLinkGameData [mystery_gift.c:337] would produce."""
+    data = bytearray(mg_script.GAME_DATA_SIZE)
+    data[0x00:0x04] = magic.to_bytes(4, "little")
+    data[0x04:0x06] = (1).to_bytes(2, "little")
+    data[0x08:0x0C] = (1).to_bytes(4, "little")
+    data[0x0C:0x0E] = (1).to_bytes(2, "little")
+    data[0x10:0x14] = version_code.to_bytes(4, "little")
+    data[0x14:0x16] = flag_id.to_bytes(2, "little")
+    data[mg_script.GD_OFF_METADATA_ICON:mg_script.GD_OFF_METADATA_ICON + 2] = \
+        metadata_icon.to_bytes(2, "little")
+    for index, (species, stamp_id) in enumerate(stamps):
+        data[mg_script.GD_OFF_STAMP_SPECIES + 2 * index:
+             mg_script.GD_OFF_STAMP_SPECIES + 2 * index + 2] = species.to_bytes(2, "little")
+        data[mg_script.GD_OFF_STAMP_IDS + 2 * index:
+             mg_script.GD_OFF_STAMP_IDS + 2 * index + 2] = stamp_id.to_bytes(2, "little")
+    data[mg_script.GD_OFF_MAX_STAMPS] = max_stamps
+    data[mg_script.GD_OFF_PLAYER_NAME:
+         mg_script.GD_OFF_PLAYER_NAME + 7] = b"\xbf\xc7\xcf\xff\xff\xff\xff"
+    data[mg_script.GD_OFF_TRAINER_ID:
+         mg_script.GD_OFF_TRAINER_ID + 4] = trainer_id.to_bytes(4, "little")
+    return bytes(data)
+
+
+def test_link_game_data_offsets_and_validation():
+    parsed = mg_script.parse_link_game_data(_game_data(flag_id=1003))
+    assert parsed.magic == mg.GAME_DATA_VALID_VAR
+    assert parsed.flag_id == 1003 and parsed.has_card
+    assert parsed.version_code == mg.VERSION_CODE_FIRERED
+    assert parsed.version_name == "FireRed"
+    assert parsed.player_name == "EMU"
+    assert parsed.trainer_id & 0xFFFF == 0x8822
+    assert mg_script.validate_link_game_data(parsed)
+
+
+# A retail French LeafGreen's game data, player PAU: `cabbcf ff 000000` then the trainer id.
+_RETAIL_PAU = bytes.fromhex(
+    "0101000001000000010000000100000002000000ed03090230100c0e0b02000000000000000023000000000000"
+    "000000000000000000000000000000000000000000000000cabbcfff00000020665eec28120c0e0e02ffff0000"
+    "0000425047460a000000")
+
+
+@pytest.mark.parametrize("name_bytes, reliable", [
+    (_RETAIL_PAU[0x45:0x4C], True),                 # a short name arrives zero-padded
+    (bytes.fromhex("c1cfccd0bbc8ff"), True),        # six characters, the terminator fits
+    (bytes.fromhex("c1cfccd0bbc8bb"), False),       # seven: the terminator lands on the id
+])
+def test_the_trainer_id_is_trusted_whenever_the_name_terminator_fits(name_bytes, reliable):
+    data = bytearray(_RETAIL_PAU)
+    data[0x45:0x4C] = name_bytes
+    parsed = mg_script.parse_link_game_data(bytes(data))
+    assert parsed.trainer_id_is_reliable is reliable
+    if name_bytes == _RETAIL_PAU[0x45:0x4C]:
+        assert parsed.player_name == "PAU" and parsed.trainer_id & 0xFFFF == 26144
+
+
+def test_link_game_data_rejects_what_the_console_rejects():
+    """Exactly the five checks in MysteryGift_ValidateLinkGameData [mystery_gift.c:373]."""
+    assert not mg_script.validate_link_game_data(
+        mg_script.parse_link_game_data(_game_data(magic=0x102)))
+    assert not mg_script.validate_link_game_data(
+        mg_script.parse_link_game_data(_game_data(version_code=0x10)))   # low nibble zero
+    for offset in (0x04, 0x08, 0x0C):
+        data = bytearray(_game_data())
+        data[offset] = 2                                     # even -> fails the & 1 test
+        assert not mg_script.validate_link_game_data(
+            mg_script.parse_link_game_data(bytes(data)))
+
+
+def _run_server(game_data, toss_response=None):
+    """Drive MysteryGiftServer through one conversation, returning (idents, result)."""
+    card, script = wonder_card.build_default_gift()
+    server = mg_server.MysteryGiftServer(card, script)
+    sent = []
+    for _ in range(32):
+        action = server.run()
+        if action[0] == "done":
+            return sent, action[1]
+        if action[0] == "send":
+            sent.append(action[1])
+            server.on_sent()
+        else:
+            ident = action[1]
+            if ident == mg.MG_LINKID_GAME_DATA:
+                server.on_received(ident, game_data)
+            elif ident == mg.MG_LINKID_RESPONSE:
+                server.on_received(ident, toss_response.to_bytes(4, "little"))
+            else:
+                server.on_received(ident, b"\x00" * 1024)
+    raise AssertionError("server script did not terminate")
+
+
+def test_server_refuses_invalid_game_data():
+    _sent, result = _run_server(_game_data(magic=0))
+    assert result == mg_server.SVR_MSG_CANT_SEND_GIFT_1
+
+
+class _Mirror:
+    """gRfu.recvBlock[GetMultiplayerId()] in the shape ``block.BlockSender`` reads."""
+
+    __slots__ = ("receiving", "count", "flags", "last_index")
+
+    def __init__(self, receiving, count, flags, last_index):
+        self.receiving = receiving
+        self.count = count
+        self.flags = flags
+        self.last_index = last_index
+
+
+class ConsoleClientModel:
+    """The Switch side: RFU block receive gate + MysteryGiftLink + client script engine."""
+
+    RECV_READY, RECV_RECEIVING, RECV_FINISHED = 0, 1, 2
+
+    def __init__(self, *, flag_id=0, max_stamps=0, metadata_icon=0,
+                 stamps=(), toss_answer=0, consume_latency=2,
+                 saved_news=None, trainer_id=CONSOLE_TRAINER_ID,
+                 save_trainer_id=None, rom_stubs=None):
+        self.lp = linkplayer.LinkPlayer(name="ASH", version=linkplayer.VERSION_FIRE_RED,
+                                        player_id=1)
+        self.toss_answer = toss_answer
+        # Our ROM is a header and zeros; a payload that calls a ROM function needs a stub here.
+        self.rom_stubs = dict(rom_stubs or {})
+        # Frames between a block completing and MGL_Receive consuming it; the host's margin must
+        # survive either order.
+        self.consume_latency = consume_latency
+        self._received_age = 0
+        self.metadata_icon = metadata_icon
+        self.stamps = list(stamps)
+        self.max_stamps = max_stamps
+        self.game_data = _game_data(
+            flag_id=flag_id, max_stamps=max_stamps,
+            metadata_icon=metadata_icon, stamps=stamps, trainer_id=trainer_id)
+        # What gSaveBlock2Ptr holds; a test drives it apart from the game data.
+        self.save_trainer_id = trainer_id if save_trainer_id is None else save_trainer_id
+        self.buffer_scripts = []
+        self.vars = {var: 0 for var in range(0x40B6, 0x40BD)}
+        self.flags = set()
+        self.activation_scripts = []
+        self.national_dex = False
+        self.ribbons = []
+        self.rare_words = []
+
+        self.recv_state = self.RECV_READY
+        self.recv_count = 0
+        self.recv_flags = 0
+        self.recv_buf = bytearray()
+        self.block_received = False
+        self.redundant_inits = 0        # benign: HandleBlockSend re-sends INIT by design
+        self.dropped_inits = 0          # fatal: previous block not consumed yet
+        self.dropped_fragments = 0
+        self.redundant_fragments = 0   # a repeat of a fragment already held; the console ignores it
+
+        self.phase = "wait_req"
+        self.host_link_player = None
+        self.standby_sent = False
+        self.standby_echoed = False
+
+        # Mystery Gift client [mystery_gift_client.c].
+        self.script = mg_script.CLIENT_SCRIPT_INIT
+        self.cmdidx = 0
+        self.func = "idle"
+        self.param = 0
+        self.recv_buffer = bytearray(mg.MG_LINK_BUFFER_SIZE)
+        self.link_recv = mg_link.MysteryGiftLinkReceiver()
+        self.saved_card = None
+        self.saved_ram_script = None
+        self.saved_trainer = None
+        self.saved_news = None if saved_news is None else bytes(saved_news)
+        self.dynamic_msg = None
+        self.result = None
+        self.messages_received = []
+
+        self._send_blocks = []
+        self._sender = None
+        self._send_stage = 0            # MGL_Send's link->state: 0 header, 1 chunks, 3 finishing
+        self._pending_send = None
+
+        # gRfu.recvBlock[1]: this console's own commands mirrored in row one; the block gate runs
+        # over the child itself [link_rfu_2.c:1125, :970].
+        self.own_state = self.RECV_READY
+        self.own_count = 0
+        self.own_flags = 0
+        self.own_last_index = -1
+        self.own_block_received = False
+        self.own_dropped_inits = 0      # an INIT mirrored back while the previous block is unconsumed
+        self.own_redundant_inits = 0
+        self.own_fragments_mirrored = 0
+        self.own_resends = 0            # fragments re-sent because their echo never came back
+
+    def _feed_parent_row(self, row):
+        rec = rfu.parse_slot(row)
+        if rec is None:
+            return None
+        op = rec["op"]
+        if op == rfu.SEND_BLOCK_INIT:
+            if self.recv_state == self.RECV_READY:
+                self.recv_count = rec["count"]
+                self.recv_flags = 0
+                self.recv_buf = bytearray(self.recv_count * block.FRAG_BYTES)
+                self.recv_state = self.RECV_RECEIVING
+                self.block_received = False
+            elif self.recv_state == self.RECV_RECEIVING:
+                # Expected: HandleBlockSend re-sends SEND_BLOCK_INIT for several
+                # frames [link_rfu_2.c:1370] and the receiver ignores the repeats.
+                self.redundant_inits += 1
+            else:
+                # RECV_FINISHED: the INIT is discarded and the console waits forever.
+                self.dropped_inits += 1
+        elif op == rfu.SEND_BLOCK:
+            if self.recv_state == self.RECV_RECEIVING:
+                index = rec["index"]
+                self.recv_flags |= 1 << index
+                self.recv_buf[index * block.FRAG_BYTES:
+                              (index + 1) * block.FRAG_BYTES] = rec["frag"]
+                if self.recv_flags == block.all_received_mask(self.recv_count):
+                    self.recv_state = self.RECV_FINISHED
+                    self.block_received = True
+                    self._received_age = 0
+            elif ((self.recv_flags >> rec["index"]) & 1
+                  and self.recv_buf[rec["index"] * block.FRAG_BYTES:
+                                    (rec["index"] + 1) * block.FRAG_BYTES] == rec["frag"]):
+                self.redundant_fragments += 1
+            else:
+                self.dropped_fragments += 1
+        return rec
+
+    def _feed_own_row(self, row):
+        """RfuHandleReceiveCommand for i == our own multiplayer id [link_rfu_2.c:1125]."""
+        if row is None:
+            return
+        rec = rfu.parse_slot(row)
+        if rec is None:
+            return
+        if rec["op"] == rfu.SEND_BLOCK_INIT:
+            if self.own_state == self.RECV_READY:
+                self.own_count = rec["count"]
+                self.own_flags = 0
+                self.own_last_index = -1
+                self.own_state = self.RECV_RECEIVING
+                self.own_block_received = False
+            elif self.own_state == self.RECV_RECEIVING:
+                self.own_redundant_inits += 1
+            else:
+                # RECV_STATE_FINISHED: this INIT is discarded.
+                self.own_dropped_inits += 1
+        elif rec["op"] == rfu.SEND_BLOCK:
+            # SendLastBlock reads the raw mirrored command word [link_rfu_2.c:1408]; only the
+            # bitmask and the completion flag are gated on RECEIVING [:1152].
+            index = rec["index"]
+            self.own_last_index = index
+            if self.own_state == self.RECV_RECEIVING:
+                if not (self.own_flags >> index) & 1:
+                    self.own_fragments_mirrored += 1
+                self.own_flags |= 1 << index
+                if self.own_flags == block.all_received_mask(self.own_count):
+                    self.own_state = self.RECV_FINISHED
+                    self.own_block_received = True
+
+    def _own_mirror(self):
+        """What ``BlockSender`` calls its ack: gRfu.recvBlock[GetMultiplayerId()]."""
+        return _Mirror(self.own_state == self.RECV_RECEIVING or self.own_state == self.RECV_FINISHED,
+                       self.own_count, self.own_flags, self.own_last_index)
+
+    def _reset_own_received(self):
+        """MGL_ResetReceived(sendPlayerId) -> Rfu_ResetBlockReceivedFlag [link_rfu_2.c:1060]."""
+        self.own_block_received = False
+        self.own_state = self.RECV_READY
+
+    def _own_tick(self):
+        """One VBlank of the console's RFU block send; a non-last SEND_BLOCK while holding is a
+        repair [link_rfu_2.c:1015,1404]."""
+        words = self._sender.tick(self._own_mirror())
+        if self._sender.state == block.HOLD:
+            w0 = words[0]
+            if ((w0 & rfu.RFUCMD_MASK) == rfu.SEND_BLOCK
+                    and (w0 & rfu.FRAG_INDEX_MASK) != self._sender.count - 1):
+                self.own_resends += 1
+        return rfu.serialize(words)
+
+    def _new_own_sender(self, data):
+        """Rfu_InitBlockSend: re-sends every frame until its own command comes back
+        [link_rfu_2.c:1366-1416]."""
+        sender = block.BlockSender(data, owner=1, trust_pia=False,
+                                   watchdog_init=1 << 30, watchdog_hold=1 << 30)
+        sender.HOLD_RESEND_GAP = 0
+        return sender
+
+    @property
+    def _consumable(self):
+        return self.block_received and self._received_age >= self.consume_latency
+
+    def _reset_received(self):
+        self.block_received = False
+        self.recv_state = self.RECV_READY
+
+    def _run_buffer_script(self, payload):
+        sav2 = bytearray(0x1000)
+        sav2[buffer_script.SAV2_PLAYER_TRAINER_ID:
+             buffer_script.SAV2_PLAYER_TRAINER_ID + 4] = (
+                 self.save_trainer_id.to_bytes(4, "little"))
+        param = self.param if isinstance(self.param, int) else 0
+        armed = self._pending_send
+        ident, size = (armed[0], armed[2]) if armed else (mg.MG_LINKID_RESPONSE, 4)
+        # Called every frame until it returns 1; the payload is copied once
+        # [decomp:src/mystery_gift_client.c:239,276].
+        try:
+            run = buffer_script.emulate_repeating(
+                payload, param=param, sav2=bytes(sav2), send_size=size, send_ident=ident,
+                memory=self.rom_stubs or None, max_calls=1200).final
+        except buffer_script.BufferScriptError as exc:
+            raise AssertionError(
+                f"the payload never returned 1: on the console the Mystery Gift menu hangs ({exc})"
+            ) from None
+        self.param = run.param
+        if run.client.send_changed:
+            # The send pointer and size are read at send time [mystery_gift_link.c:59,166].
+            self._pending_send = (run.client.send_ident, run.pending_send, run.client.send_size)
+
+    def step(self, parent_row, echo_row=None):
+        """One VBlank: row 0 of the parent's table is the host's command, row 1 is ours mirrored back."""
+        rec = self._feed_parent_row(parent_row)
+        self._feed_own_row(echo_row)
+        if self.block_received:
+            self._received_age += 1
+        if self.phase != "gift":
+            return self._step_link(rec)
+        return self._step_gift()
+
+    def _step_link(self, rec):
+        if rec is not None and rec["op"] == rfu.SEND_BLOCK_REQ and self.phase == "wait_req":
+            # Both sides Rfu_InitBlockSend their 200-byte LinkPlayerBlock.
+            self.phase = "exchange"
+            self._sender = self._new_own_sender(
+                linkplayer.build_block(self.lp).ljust(200, b"\x00"))
+        if self._consumable and self.host_link_player is None:
+            parsed, ok = linkplayer.parse_block(bytes(self.recv_buf))
+            assert ok, "host LinkPlayer block failed the GameFreak magic check"
+            self.host_link_player = parsed
+            self._reset_received()
+        if self._sender is not None and not self._sender.done:
+            return self._own_tick()
+        if self._sender is not None:
+            # Task_PlayerExchange case 4/5: every player's block is complete - our own mirrored copy
+            # included - before LinkPlayerFromBlock and Rfu_ResetBlockReceivedFlag [link_rfu_2.c:1864].
+            if not self.own_block_received:
+                return rfu.idle_slot()
+            self._reset_own_received()
+            self._sender = None
+        if self.host_link_player is not None and not self.standby_sent:
+            # union_room.c:2391 SetLinkStandbyCallback, once.
+            self.standby_sent = True
+            return rfu.serialize(rfu.exit_standby_words(0))
+        if rec is not None and rec["op"] == rfu.READY_EXIT_STANDBY and self.standby_sent:
+            self.standby_echoed = True
+            self.phase = "gift"          # mystery_gift_menu.c:1231 MysteryGiftClient_Create
+        return rfu.idle_slot()
+
+    def _step_gift(self):
+        if self.func == "idle":
+            self.func = "run"
+        if self.func == "recv":
+            return self._step_recv()
+        if self.func == "send":
+            return self._step_send()
+        if self.func == "run":
+            self._run_one_command()
+        return rfu.idle_slot()
+
+    def _step_recv(self):
+        if self._consumable:
+            payload = self.link_recv.feed_block(bytes(self.recv_buf))
+            self._reset_received()
+            if payload is not None:
+                self.recv_buffer[:len(payload)] = payload
+                self.messages_received.append((self.link_recv.ident, payload))
+                self.func = "run"
+        return rfu.idle_slot()
+
+    def _step_send(self):
+        """MGL_Send [mystery_gift_link.c:150]: the header ungated, then each chunk waits on the
+        console's own mirrored block."""
+        if self._sender is not None:
+            row = self._own_tick()
+            if self._sender.done:
+                self._sender = None
+            return row
+
+        if self._send_stage == 0:
+            self._sender = self._new_own_sender(self._send_blocks.pop(0))
+            self._send_stage = 1
+            return self._own_tick()
+
+        if not self.own_block_received:
+            return rfu.idle_slot()
+        self._reset_own_received()
+        if self._send_blocks:
+            self._sender = self._new_own_sender(self._send_blocks.pop(0))
+            return self._own_tick()
+        self._send_stage = 0
+        self.func = "run"
+        return rfu.idle_slot()
+
+
+    def _run_mystery_event(self, payload):
+        """MEventScript_Run [mystery_event_script.c], from the decomp: operands relocate by
+        ``operand - data[1] + data[0]``; the chain runs until a command returns TRUE [script.c:107]."""
+        status = 0
+        position = 0
+
+        def read(width):
+            nonlocal position
+            value = int.from_bytes(payload[position:position + width], "little")
+            position += width
+            return value
+
+        def field_script(start):
+            # RunScriptImmediately over the field command table; only what the activation scripts
+            # actually use is modelled [mystery_event_script.c:145].
+            while True:
+                opcode = payload[start]
+                start += 1
+                if opcode == 0x02:                  # end
+                    return
+                if opcode == 0x2A:                  # clearflag
+                    self.flags.discard(int.from_bytes(payload[start:start + 2], "little"))
+                    start += 2
+                elif opcode == 0x16:                # setvar
+                    self.vars[int.from_bytes(payload[start:start + 2], "little")] = (
+                        int.from_bytes(payload[start + 2:start + 4], "little"))
+                    start += 4
+                else:
+                    raise AssertionError(f"unsupported field opcode {opcode:#x}")
+
+        while True:
+            opcode = payload[position]
+            position += 1
+            if opcode == 0:                         # nop
+                continue
+            if opcode == 2:                         # end
+                return status
+            if opcode == 4:                         # setstatus
+                status = read(1)
+            elif opcode == 5:                       # runscript
+                field_script(read(4))
+            elif opcode == 9:                       # givenationaldex
+                self.national_dex = True
+                status = 2
+            elif opcode == 8:                       # giveribbon
+                self.ribbons.append((read(1), read(1)))
+                status = 2
+            elif opcode == 10:                      # addrareword
+                self.rare_words.append(read(1))
+                status = 2
+            elif opcode == 15:                      # checksum: terminal, data[3] is 0
+                expected, start, end = read(4), read(4), read(4)
+                if expected != sum(payload[start:end]) & 0xFFFFFFFF:
+                    status = 1
+                return status
+            else:
+                raise AssertionError(f"unsupported Mystery Event opcode {opcode}")
+
+    def _begin_send(self, ident, payload, size):
+        self._send_blocks = mg_link.build_message(ident, payload, size)
+        self._send_stage = 0
+        self.func = "send"
+
+    def _run_one_command(self):
+        offset = self.cmdidx * mg_script.CLIENT_CMD_SIZE
+        instr = int.from_bytes(self.script[offset:offset + 4], "little")
+        param = int.from_bytes(self.script[offset + 4:offset + 8], "little")
+        self.cmdidx += 1
+        if instr == mg_script.CLI_NONE:
+            return
+        if instr == mg_script.CLI_RECV:
+            self.link_recv.expect(param)
+            self.func = "recv"
+        elif instr == mg_script.CLI_COPY_RECV:
+            self.script = bytes(self.recv_buffer)
+            self.cmdidx = 0
+        elif instr == mg_script.CLI_LOAD_GAME_DATA:
+            self._pending_send = (mg.MG_LINKID_GAME_DATA, self.game_data,
+                                 len(self.game_data))
+        elif instr == mg_script.CLI_SEND_LOADED:
+            self._begin_send(*self._pending_send)
+        elif instr == mg_script.CLI_SAVE_CARD:
+            self.saved_card = bytes(self.recv_buffer[:332])
+            self.max_stamps = self.saved_card[9]
+            self.metadata_icon = int.from_bytes(self.saved_card[2:4], "little")
+            self.stamps = []
+            for var in range(0x40B6, 0x40BD):
+                self.vars[var] = 0
+            self.flags.discard(0x3D8)
+        elif instr == mg_script.CLI_SAVE_NEWS:
+            # IsWonderNewsSameAsSaved compares the whole struct [mystery_gift.c:140]; SaveWonderNews
+            # refuses id 0 [:113]. The answer is MG_LINKID_RESPONSE [mystery_gift_client.c:210].
+            news = bytes(self.recv_buffer[:wonder_news.WONDER_NEWS_SIZE])
+            same = (self.saved_news is not None
+                    and wonder_news.validate(self.saved_news)
+                    and self.saved_news == news)
+            if not same and wonder_news.validate(news):
+                self.saved_news = news
+            self._pending_send = (mg.MG_LINKID_RESPONSE,
+                                  (1 if same else 0).to_bytes(4, "little"), 4)
+        elif instr == mg_script.CLI_SAVE_RAM_SCRIPT:
+            # InitRamScript_NoObjectEvent clamps to script[995] [src/script.c:577].
+            self.saved_ram_script = bytes(self.recv_buffer[:995])
+        elif instr == mg_script.CLI_RECV_EREADER_TRAINER:
+            # memcpy into battleTower.ereaderTrainer, then ValidateEReaderTrainer clears a struct
+            # whose checksum does not match [mystery_gift_client.c:233, battle_tower.c:1354].
+            trainer = bytes(self.recv_buffer[:ereader_trainer.TRAINER_SIZE])
+            self.saved_trainer = trainer if ereader_trainer.validate(trainer) else None
+        elif instr == mg_script.CLI_SAVE_STAMP:
+            stamp = (int.from_bytes(self.recv_buffer[0:2], "little"),
+                     int.from_bytes(self.recv_buffer[2:4], "little"))
+            if (stamp[0] and stamp[1]
+                    and all(stamp[0] != old[0] and stamp[1] != old[1]
+                            for old in self.stamps)
+                    and len(self.stamps) < self.max_stamps):
+                self.stamps.append(stamp)
+        elif instr == mg_script.CLI_RUN_MEVENT_SCRIPT:
+            payload = bytes(self.recv_buffer)
+            self.activation_scripts.append(payload)
+            self.param = self._run_mystery_event(payload)
+        elif instr == mg_script.CLI_RUN_BUFFER_SCRIPT:
+            # Called once per frame until it returns 1 [mystery_gift_client.c:237,276].
+            payload = bytes(self.recv_buffer)
+            self.buffer_scripts.append(payload)
+            self._run_buffer_script(payload)
+        elif instr == mg_script.CLI_COPY_MSG:
+            # A fixed CLIENT_MAX_MSG_SIZE bytes are copied [mystery_gift_client.c]; the text is
+            # EOS-terminated.
+            self.dynamic_msg = bytes(self.recv_buffer[:mg_script.CLIENT_MAX_MSG_SIZE])
+        elif instr == mg_script.CLI_ASK_TOSS:
+            self.param = self.toss_answer
+        elif instr == mg_script.CLI_LOAD_TOSS_RESPONSE:
+            self._pending_send = (mg.MG_LINKID_RESPONSE,
+                                 self.param.to_bytes(4, "little"), 4)
+        elif instr == mg_script.CLI_SEND_READY_END:
+            self._begin_send(mg.MG_LINKID_READY_END, b"", 0)
+        elif instr == mg_script.CLI_RETURN:
+            self.result = param
+            self.func = "done"
+        else:
+            raise AssertionError(f"console model has no case for instruction {instr}")
+
+
+def _drive(console, *, max_frames=4000, card=None, ram_script=None,
+           distribution=None, timing=None, require_completion=True,
+           echo=None, child_burst=1, burst_every=120, log=None):
+    """Run the engine against the console model; row 1 relays through rfu_leader.ChildEcho
+    [link_rfu_2.c:743]."""
+    if distribution is not None:
+        card, ram_script = distribution.card, distribution.ram_script
+    elif card is None:
+        card, ram_script = wonder_card.build_default_gift()
+    if timing is None:
+        timing = host_mystery_gift.MysteryGiftTiming(client_ready_idle_frames=10)
+    kwargs = dict(
+        link_player=linkplayer.LinkPlayer(
+            name="EMU", version=linkplayer.VERSION_FIRE_RED),
+        timing=timing)
+    if log is not None:
+        kwargs["log"] = log
+    engine = (host_mystery_gift.HostMysteryGiftEngine(
+                  distribution=distribution, **kwargs)
+              if distribution is not None else
+              host_mystery_gift.HostMysteryGiftEngine(card, ram_script, **kwargs))
+    close_rows = 0
+    echo = rfu_leader.ChildEcho() if echo is None else echo
+    held = []
+    for frame in range(max_frames):
+        parent_row = rfu.serialize(engine.tick())
+        child_row = console.step(parent_row, echo.next_row())
+        if console.func == "done" and close_rows < 4:
+            # Rfu_SetCloseLinkCallback [mystery_gift_menu.c:1248].
+            child_row = rfu.serialize(rfu.close_link_words(1))
+            close_rows += 1
+        held.append(child_row)
+        if len(held) >= (child_burst if frame % burst_every < child_burst else 1):
+            for row in held:
+                echo.append(rfu_leader._normalize_child_cmd(row))
+                engine.feed_child_slot(row)
+            held.clear()
+        if engine.disconnect_requested:
+            engine.mark_disconnect_sent()
+            return engine, frame
+    if require_completion:
+        raise AssertionError(
+            f"flow did not finish: engine={engine.state} console={console.func} "
+            f"result={console.result}")
+    return engine, None
+
+
+def test_end_to_end_gift_reaches_a_console_with_no_card():
+    card, ram_script = wonder_card.build_default_gift()
+    console = ConsoleClientModel(flag_id=0)
+    engine, _frames = _drive(console, card=card, ram_script=ram_script)
+
+    assert console.result == mg_script.CLI_MSG_CARD_RECEIVED
+    assert engine.result == mg_server.SVR_MSG_CARD_SENT and engine.gift_sent
+    assert engine.state == host_mystery_gift.MG_DONE and engine.done
+    assert console.saved_card == card
+    assert console.saved_ram_script.startswith(ram_script)
+    assert console.saved_ram_script[len(ram_script):] == b"\x00" * (995 - len(ram_script))
+    assert engine.child_link_player.name == "ASH"
+    assert console.host_link_player.name == "EMU"
+
+
+def test_ram_script_block_repeat_adds_redundancy_to_only_the_ident25_message():
+    """--ram-script-block-repeat raises fragment redundancy for ident 25 only."""
+    card, ram_script = wonder_card.build_default_gift()
+    console = ConsoleClientModel(flag_id=0)
+    timing = host_mystery_gift.MysteryGiftTiming(
+        client_ready_idle_frames=10, block_repeat=2, ram_script_block_repeat=4)
+    engine, _frames = _drive(console, card=card, ram_script=ram_script, timing=timing)
+    assert engine.result == mg_server.SVR_MSG_CARD_SENT and engine.gift_sent
+
+    ram_label = f"ident{mg.MG_LINKID_RAM_SCRIPT}:"
+    by_repeat = {}
+    for entry in engine.trace:
+        if entry[0] == "send_block":
+            label, repeat = entry[1], entry[3]
+            by_repeat.setdefault(label.startswith(ram_label), set()).add(repeat)
+    assert by_repeat.get(True) == {4}, "ident-25 fragments must use ram_script_block_repeat"
+    assert by_repeat.get(False) == {2}, "other messages must keep the base block_repeat"
+
+    console2 = ConsoleClientModel(flag_id=0)
+    plain = host_mystery_gift.MysteryGiftTiming(
+        client_ready_idle_frames=10, block_repeat=2, ram_script_block_repeat=2)
+    engine2, _ = _drive(console2, card=card, ram_script=ram_script, timing=plain)
+    repeats = {e[3] for e in engine2.trace if e[0] == "send_block"}
+    assert repeats == {2}, "ident 25 at the base repeat must not be special-cased"
+
+
+def test_end_to_end_never_drops_a_block_init():
+    """An INIT arriving before the previous block is consumed is discarded and the transfer hangs."""
+    console = ConsoleClientModel(flag_id=0)
+    _drive(console)
+    assert console.dropped_inits == 0
+    assert console.dropped_fragments == 0
+    # Without native INIT resends this test would pass for the wrong reason.
+    assert console.redundant_inits > 0
+
+
+def test_inter_block_gap_is_what_prevents_the_drop():
+    """MysteryGiftTiming.inter_block_gap_frames is all that stops the host overrunning the console."""
+    slow = ConsoleClientModel(flag_id=0, consume_latency=6)
+    _drive(slow)                                        # default gap absorbs it
+    assert slow.dropped_inits == 0 and slow.result == mg_script.CLI_MSG_CARD_RECEIVED
+
+    starved = ConsoleClientModel(flag_id=0, consume_latency=6)
+    engine, finished = _drive(
+        starved, max_frames=1500, require_completion=False,
+        timing=host_mystery_gift.MysteryGiftTiming(
+            client_ready_idle_frames=10, inter_block_gap_frames=0))
+    assert starved.dropped_inits > 0
+    assert finished is None and starved.result is None
+    assert engine.result is None
+
+
+def test_pacing_budget_is_what_the_timing_docstring_claims():
+    gap = host_mystery_gift.DEFAULT_MYSTERY_GIFT_TIMING.inter_block_gap_frames
+
+    def survives(latency):
+        console = ConsoleClientModel(flag_id=0, consume_latency=latency)
+        _drive(console, max_frames=6000, require_completion=False)
+        return console.result == mg_script.CLI_MSG_CARD_RECEIVED, console.dropped_inits
+
+    lossless, dropped = survives(gap + 1)
+    assert lossless and dropped == 0, "clean margin should be the gap plus one frame"
+    completed, dropped = survives(gap + 5)
+    assert completed and dropped > 0, "INIT resends should still rescue a late console"
+    completed, _dropped = survives(gap + 8)
+    assert not completed, "past the budget the transfer must fail, not silently pass"
+
+
+def test_end_to_end_message_sequence_matches_the_native_card_flow():
+    console = ConsoleClientModel(flag_id=0)
+    _drive(console)
+    assert [ident for ident, _payload in console.messages_received] == [
+        mg.MG_LINKID_CLIENT_SCRIPT,     # sClientScript_SendGameData
+        mg.MG_LINKID_CLIENT_SCRIPT,     # sClientScript_SaveCard
+        mg.MG_LINKID_CARD,
+        mg.MG_LINKID_RAM_SCRIPT,
+    ]
+
+
+def test_end_to_end_console_holding_a_different_card_is_asked_to_toss():
+    console = ConsoleClientModel(flag_id=1001, toss_answer=0)      # FALSE = tossed
+    engine, _frames = _drive(console)
+    assert engine.result == mg_server.SVR_MSG_CARD_SENT
+    assert console.result == mg_script.CLI_MSG_CARD_RECEIVED
+    assert console.saved_card is not None
+
+    console = ConsoleClientModel(flag_id=1001, toss_answer=1)      # TRUE = kept
+    engine, _frames = _drive(console)
+    assert engine.result == mg_server.SVR_MSG_CLIENT_CANCELED
+    # The card cancel path is gServerScript_ClientCanceledCard [union_room_message.c:569], ending in
+    # CLI_MSG_BUFFER_FAILURE.
+    assert console.result == mg_script.CLI_MSG_BUFFER_FAILURE
+    assert console.saved_card is None
+    assert console.dynamic_msg is not None
+    assert console.dynamic_msg.startswith(mg_script.TEXT_CANCELED_READING_CARD)
+    assert charmap.decode(console.dynamic_msg) == "Canceled reading the Card."
+
+
+def test_end_to_end_console_already_holding_this_card_is_told_so():
+    console = ConsoleClientModel(flag_id=1003)                      # our card's flagId
+    engine, _frames = _drive(console)
+    assert engine.result == mg_server.SVR_MSG_HAS_CARD
+    assert console.result == mg_script.CLI_MSG_HAD_CARD
+    assert console.saved_card is None
+
+
+def _new_link_player_engine():
+    card, ram_script = wonder_card.build_default_gift()
+    # These tests inspect the exact fragment sequence, so send each fragment once.
+    timing = host_mystery_gift.MysteryGiftTiming(block_repeat=1, ram_script_block_repeat=1)
+    return host_mystery_gift.HostMysteryGiftEngine(card, ram_script, timing=timing)
+
+
+def _drain_link_player_opening(engine):
+    """Drive exactly the parent task's ID announcement and one block request."""
+    repeat = engine.timing.player_ids_repeat_frames
+    for _ in range(repeat):
+        assert engine.tick() == list(rfu.send_player_ids_words())
+    assert engine.tick() == list(rfu.send_block_req_words(trade.BLOCK_REQ_SIZE_NONE))
+
+
+def _send_child_link_player(engine, payload, *, owner=1):
+    engine.feed_child_slot(rfu.serialize(rfu.init_words(trade.COUNT_PARTY, owner=owner)))
+    sender = block.BlockSender(payload, owner=owner, trust_pia=True)
+    while not sender.done:
+        engine.feed_child_slot(rfu.serialize(sender.tick(None)))
+
+
+def test_link_player_opening_is_immediate_and_block_request_is_one_shot():
+    """The Switch child creates Task_PlayerExchange directly from CHILD_JOINED."""
+    engine = _new_link_player_engine()
+    _drain_link_player_opening(engine)
+    assert engine._link_player_requests == 1
+    assert engine._link_phase == "wait_child_block"
+
+    requests = 1
+    for _ in range(400):
+        words = engine.tick()
+        if list(words) == list(rfu.send_block_req_words(trade.BLOCK_REQ_SIZE_NONE)):
+            requests += 1
+        engine.feed_child_slot(rfu.idle_slot())
+    assert requests == 1
+    assert engine._our_blocks_sent == 0
+    assert engine.state == host_mystery_gift.MG_LINK_PLAYER
+
+
+def test_link_player_block_is_sent_only_after_a_completed_valid_child_block():
+    engine = _new_link_player_engine()
+    _drain_link_player_opening(engine)
+
+    # An INIT is not enough: case 0 may still reset the receive flags.
+    engine.feed_child_slot(rfu.serialize(rfu.init_words(trade.COUNT_PARTY, owner=1)))
+    assert not engine._host_link_player_queued
+    assert not engine._host_link_player_complete
+    assert all((engine.tick()[0] & rfu.RFUCMD_MASK)
+               not in (rfu.SEND_BLOCK_INIT, rfu.SEND_BLOCK)
+               for _ in range(10))
+
+    payload = linkplayer.build_block(
+        linkplayer.LinkPlayer(name="ASH", player_id=1)).ljust(200, b"\x00")
+    sender = block.BlockSender(payload, owner=1, trust_pia=True)
+    while not sender.done:
+        engine.feed_child_slot(rfu.serialize(sender.tick(None)))
+    assert engine.child_link_player.name == "ASH"
+    assert engine._host_link_player_queued
+    assert not engine._host_link_player_complete
+
+    for _ in range(64):
+        engine.tick()
+        if engine._host_link_player_complete:
+            break
+    assert engine._host_link_player_complete
+    assert engine._link_phase == "wait_standby"
+    assert engine._link_player_outbound == [
+        *(("INIT", trade.COUNT_PARTY, 0x80),) * 4,
+        *(("BLOCK", index) for index in range(trade.COUNT_PARTY)),
+    ]
+    trace_names = [entry[0] for entry in engine.trace]
+    assert trace_names.index("link_player_child_block_valid") < \
+        trace_names.index("link_player_host_block_queued") < \
+        trace_names.index("link_player_host_block_complete")
+
+    engine.feed_child_slot(rfu.serialize(rfu.exit_standby_words(0)))
+    assert engine.state == host_mystery_gift.MG_START
+
+
+def test_early_link_player_standby_is_latched_until_the_host_block_finishes():
+    """A child standby sent before our last fragment is latched, not ignored."""
+    engine = _new_link_player_engine()
+    _drain_link_player_opening(engine)
+    _send_child_link_player(
+        engine,
+        linkplayer.build_block(
+            linkplayer.LinkPlayer(name="ASH", player_id=1)).ljust(200, b"\x00"))
+
+    for _ in range(20):
+        engine.tick()
+    assert not engine._host_link_player_complete
+    engine.feed_child_slot(rfu.serialize(rfu.exit_standby_words(7)))
+    assert engine.state == host_mystery_gift.MG_LINK_PLAYER
+    assert engine._pending_standby_count == 7
+
+    for _ in range(16):
+        engine.tick()
+        if engine.state == host_mystery_gift.MG_START:
+            break
+    assert engine._host_link_player_complete
+    assert engine.state == host_mystery_gift.MG_START
+    assert engine._pending_standby_count is None
+    assert ("link_player_barrier_complete", 7) in engine.trace
+
+
+def test_player_id_repair_never_repeats_the_destructive_block_request():
+    engine = _new_link_player_engine()
+    _drain_link_player_opening(engine)
+    engine.feed_child_slot(rfu.serialize(rfu.init_words(trade.COUNT_PARTY, owner=0)))
+    assert engine._child_mp_id == 0
+
+    repair = engine.timing.player_ids_repeat_frames
+    for _ in range(repair):
+        assert engine.tick() == list(rfu.send_player_ids_words())
+    assert all(engine.tick() != list(rfu.send_block_req_words(trade.BLOCK_REQ_SIZE_NONE))
+               for _ in range(100))
+    assert engine._link_player_requests == 1
+
+
+def test_stale_link_player_block_stops_without_restarting_the_child_transfer():
+    """A second SEND_BLOCK_REQ starts a new send while Task_PlayerExchange waits at case 4; report instead."""
+    engine = _new_link_player_engine()
+    _drain_link_player_opening(engine)
+    _send_child_link_player(engine, b"\xdd" * 200)
+    assert engine.rejected_link_players == 1
+    assert engine.child_link_player is None
+    assert engine._link_phase == "invalid_child_block"
+
+    for _ in range(300):
+        words = engine.tick()
+        assert (words[0] & rfu.RFUCMD_MASK) not in (rfu.SEND_BLOCK_REQ,
+                                                     rfu.SEND_BLOCK_INIT,
+                                                     rfu.SEND_BLOCK)
+        engine.feed_child_slot(rfu.idle_slot())
+    assert engine._link_player_requests == 1
+
+
+def _visiting_trainer():
+    from pokeldn.frlg.gift import gift_registry
+    return gift_registry.GIFT_REGISTRY.build_distribution("visiting-trainer")
+
+
+def test_end_to_end_the_visiting_trainer_lands_in_the_save():
+    distribution = _visiting_trainer()
+    console = ConsoleClientModel(flag_id=0)
+    engine, _frames = _drive(console, distribution=distribution)
+
+    assert console.result == mg_script.CLI_MSG_TRAINER_RECEIVED
+    assert engine.result == mg_server.SVR_MSG_GIFT_SENT_1 and engine.gift_sent
+    assert engine.state == host_mystery_gift.MG_DONE and engine.done
+    assert console.saved_trainer == distribution.trainer
+    assert ereader_trainer.validate(console.saved_trainer)
+    assert console.saved_card == distribution.card
+
+
+def test_end_to_end_the_trainer_message_sequence_adds_ident_26_to_the_card_flow():
+    console = ConsoleClientModel(flag_id=0)
+    _drive(console, distribution=_visiting_trainer())
+    assert [ident for ident, _payload in console.messages_received] == [
+        mg.MG_LINKID_CLIENT_SCRIPT,     # sClientScript_SendGameData
+        mg.MG_LINKID_CLIENT_SCRIPT,     # CLIENT_SCRIPT_SAVE_CARD_AND_TRAINER
+        mg.MG_LINKID_CARD,
+        mg.MG_LINKID_RAM_SCRIPT,
+        mg.MG_LINKID_EREADER_TRAINER,
+    ]
+
+
+def test_end_to_end_a_console_already_holding_the_card_takes_the_trainer_alone():
+    """The rematch path: no toss prompt, no card, just the 188 bytes again."""
+    distribution = _visiting_trainer()
+    flag_id = int.from_bytes(distribution.card[0:2], "little")
+    console = ConsoleClientModel(flag_id=flag_id)
+    engine, _frames = _drive(console, distribution=distribution)
+
+    assert engine.result == mg_server.SVR_MSG_GIFT_SENT_1
+    assert console.result == mg_script.CLI_MSG_TRAINER_RECEIVED
+    assert console.saved_card is None
+    assert console.saved_trainer == distribution.trainer
+    assert [ident for ident, _payload in console.messages_received] == [
+        mg.MG_LINKID_CLIENT_SCRIPT,
+        mg.MG_LINKID_CLIENT_SCRIPT,
+        mg.MG_LINKID_EREADER_TRAINER,
+    ]
+
+
+def test_end_to_end_a_console_holding_another_card_is_asked_to_toss_first():
+    distribution = _visiting_trainer()
+    console = ConsoleClientModel(flag_id=1003, toss_answer=0)      # FALSE = tossed
+    engine, _frames = _drive(console, distribution=distribution)
+    assert engine.result == mg_server.SVR_MSG_GIFT_SENT_1
+    assert console.saved_trainer == distribution.trainer
+
+    console = ConsoleClientModel(flag_id=1003, toss_answer=1)      # TRUE = kept
+    engine, _frames = _drive(console, distribution=distribution)
+    assert engine.result == mg_server.SVR_MSG_CLIENT_CANCELED
+    assert console.saved_trainer is None
+    assert console.saved_card is None
+
+
+def test_the_host_status_line_reports_the_state_of_row_one():
+    card, ram_script = wonder_card.build_default_gift()
+    said = []
+    engine = host_mystery_gift.HostMysteryGiftEngine(card, ram_script, log=said.append)
+    engine.echo_backlog, engine.echo_backlog_peak = 1, 4
+    engine.echo_coalesced, engine.echo_dropped = 37, 0
+    engine._report_status()
+    assert "row-one echo backlog 1 (peak 4), 37 repeat(s) folded, none dropped" in said[-1]
+
+    engine.echo_dropped = 2
+    engine._report_status()
+    assert "2 DROPPED" in said[-1]

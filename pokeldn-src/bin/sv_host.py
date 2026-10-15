@@ -1,0 +1,945 @@
+#!/usr/bin/env python3
+"""Host a Scarlet / Violet local trade network for a searching retail console (docs/sv.md).
+
+    sudo ./.venv/bin/python bin/sv_host.py --seconds 240 --capture scratchpad/svNN_host.jsonl
+
+    (them) X -> Poke Portal -> Link Trade, offline, no code -> search
+"""
+from pathlib import Path
+import argparse
+import binascii
+import json
+import os
+import struct
+import sys
+import time
+import traceback
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from pokeldn.host_support import open_output
+from pokeldn import pokemon as pokemon_service
+from pokeldn import config
+from pokeldn import sv
+from pokeldn.ldn import pia6, pia_connect, reliable5
+from pokeldn.sv import pokemon, port2, reference, streams, trade
+from pokeldn.ldn import game_channel
+from pokeldn.ldn.ldn_mitm_host import IpHostTransport
+from pokeldn.ldn.transport import HostTransport, board_radio, find_ap_phy
+from pokeldn.host_support import resolve_keys, needs_root
+from pokeldn.ldn import show_done
+
+PROTOCOL_NAMES = {
+    0x08: "keep alive", 0x2C: "net", 0x30: "turn", 0x58: "rtt", 0x65: "sync",
+    0x68: "unreliable", 0x74: "clone atomic", 0x75: "clone event",
+    0x76: "clone broadcast event", 0x77: "clone clock", 0x7B: "voice", 0x7C: "reliable",
+    0x80: "broadcast reliable", 0x81: "stream broadcast reliable", 0x98: "session",
+    0xA0: "nat traversal result", 0xA4: "monitoring data", 0xAC: "wan nat",
+}
+SESSION_MESSAGE_NAMES = {
+    0: "join request", 1: "join request ack", 2: "join response", 3: "leave request",
+    5: "update session", 6: "update session ack", 7: "left station sync",
+    8: "left station sync ack", 9: "start host migration", 10: "start host migration ack",
+}
+
+# The band's dispatch and addressing rules are Arceus's (docs/pla.md).
+ESTABLISHING_FLAGS = pia6.MESSAGE_FLAG_SKIP_SOURCE_CHECK
+PROTO_NET = 0x2C
+PROTO_RTT = 0x58
+PROTO_UNRELIABLE = 0x68
+PROTO_CLONE_CLOCK = 0x77
+PROTO_RELIABLE = 0x7C
+PROTO_BROADCAST_RELIABLE = 0x80
+PROTO_STREAM_BROADCAST_RELIABLE = 0x81
+PROTO_SESSION = 0x98
+# 0x7C too: a host that does not ack it leaves the joiner resending its channel table all session.
+RELIABLE_PROTOCOLS = (PROTO_RELIABLE, PROTO_BROADCAST_RELIABLE, PROTO_STREAM_BROADCAST_RELIABLE)
+MESH_DESTINATION = 0x0001
+MESH_ADDRESSED = (PROTO_RTT, PROTO_BROADCAST_RELIABLE, PROTO_STREAM_BROADCAST_RELIABLE)
+PIA_HOST_VAR = 0x00C6
+HOST_STATION_INDEX = 0
+CONSOLE_STATION_INDEX = 1
+JOINER_BITMAP = 0x02
+NET_REPEAT_SECONDS = 0.5
+SESSION_JOIN_REQUEST = 0
+RTT_REQUEST = 0
+RTT_RESPONSE = 1
+# A retail bulk ack: four entries, entry k for station k's stream (docs/sv.md).
+ACK_ENTRIES = 4
+
+
+def _describe(msg):
+    name = PROTOCOL_NAMES.get(msg.protocol, "?")
+    extra = ""
+    if msg.protocol == PROTO_SESSION and msg.payload:
+        extra = f" {SESSION_MESSAGE_NAMES.get(msg.payload[0], '?')}({msg.payload[0]})"
+    return (f"proto 0x{msg.protocol:02x} {name}{extra} port={msg.port} "
+            f"flags=0x{msg.message_flags:02x} len={len(msg.payload)}")
+
+
+def build_net_probe(keys, our_ip, our_mac, station_ips, seqid, nonce8, max_stations,
+                    net_flags=ESTABLISHING_FLAGS):
+    body = pia6.build_message(
+        pia_connect.build_net_conn_request(seqid, PIA_HOST_VAR, our_mac, keys.network_id,
+                                           station_ips, max_stations=max_stations,
+                                           station_size=21),
+        protocol=PROTO_NET, port=0, message_flags=net_flags)
+    return pia6.build_packet(keys.session_key, keys.network_id, our_ip, body,
+                             dst_var=0, src_var=PIA_HOST_VAR, packet_id=0, nonce8=nonce8)
+
+
+# Replayed from an emulated pair's host, with the sequence at +4, the network id at +12 and the
+# forty game advertise bytes at +0x82 patched (docs/sv.md, Hosting for a console).
+NET_PROPERTY_BODY = bytes.fromhex(
+    "015000840000000100000000d3bb434200020004000000000000000402010000005c00000028"
+    "005c150015000000000000000000000000000000000102000000010120000000000000000000"
+    "0000000000000000000000000000000000000000000000000000000000000000000000000000"
+    "0000000000000000000000000000000000000000000000000000000000000000000000000000"
+    "0000000000000000000000648cf400000000")
+NET_PROPERTY = 0x50
+NET_PROPERTY_ACK = 0x51
+NET_PROPERTY_GAME_DATA = 0x82
+
+
+def build_net_property(keys, our_ip, seqid, nonce8, game_data=None,
+                       net_flags=ESTABLISHING_FLAGS):
+    body = bytearray(NET_PROPERTY_BODY)
+    body[4:8] = (seqid & 0xFFFFFFFF).to_bytes(4, "big")
+    body[12:16] = keys.network_id.to_bytes(4, "big")
+    if game_data is not None:
+        body[NET_PROPERTY_GAME_DATA:NET_PROPERTY_GAME_DATA + 40] = bytes(game_data)[:40].ljust(40, b"\0")
+    msg = pia6.build_message(bytes(body), protocol=PROTO_NET, port=0, message_flags=net_flags)
+    return pia6.build_packet(keys.session_key, keys.network_id, our_ip, msg,
+                             dst_var=0, src_var=PIA_HOST_VAR, packet_id=0, nonce8=nonce8)
+
+
+# RTT is eleven bytes in this band, not BDSP's thirteen; the timestamp is the sender's 19.2 MHz tick
+# (docs/sv.md, RTT).
+RTT_TICKS_PER_SECOND = 19200000
+RTT_PROBE_SECONDS = 0.41
+
+
+def build_rtt(kind, timestamp, target=0):
+    return bytes([kind & 0xFF]) + struct.pack(">QH", timestamp & ((1 << 64) - 1),
+                                              target & 0xFFFF)
+
+
+def build_reply(keys, our_ip, body, dst_var, nonce8, *, protocol=PROTO_SESSION,
+                flags=ESTABLISHING_FLAGS, port=0, packet_id=0):
+    msg = pia6.build_message(body, protocol=protocol, port=port, message_flags=flags)
+    footer_ids = ()
+    if protocol in MESH_ADDRESSED:
+        footer_ids, dst_var = (dst_var,), MESH_DESTINATION
+    return pia6.build_packet(keys.session_key, keys.network_id, our_ip, msg,
+                             dst_var=dst_var, src_var=PIA_HOST_VAR, packet_id=packet_id,
+                             nonce8=nonce8, footer_ids=footer_ids)
+
+
+def build_bulk_ack(port_high, host_next_seq, stream_id=0, unknown0=0):
+    """`port_high[k]` is the highest sequence from station k; `host_next_seq` our own next."""
+    entries = []
+    for k in range(ACK_ENTRIES):
+        high = port_high.get(k, 0)
+        entries.append(dict(stream_id=0, ack_id=high + 1, field_0x50=high + 1))
+    payload = reliable5.build_ack_payload(entries, unknown0=unknown0)
+    header = reliable5.build_header(0, reliable5.ACK_SEQUENCE, len(payload),
+                                    lowest_pending=host_next_seq, stream_id=stream_id,
+                                    destination_bits=3, bitmap=[JOINER_BITMAP])
+    return header + payload
+
+
+def build_reliable_body(protocol, flags, sequence_id, data, lowest_pending=None):
+    """0x7C takes no destination bitmap: a console acks a 0x7C message carrying one and ignores its
+    contents (docs/sv.md, Hosting for a console)."""
+    low = sequence_id if lowest_pending is None else lowest_pending
+    bits, bitmap = ((0, []) if protocol == PROTO_RELIABLE else (3, [JOINER_BITMAP]))
+    return reliable5.build_header(flags, sequence_id, len(data), lowest_pending=low, stream_id=0,
+                                  destination_bits=bits, bitmap=bitmap) + data
+
+
+def parse_send_payload(hx):
+    """-> (data, flags) of a HEX[:z][:start|:end] send spec (`pokeldn.sv.streams`)."""
+    return streams.parse_send_spec(hx)
+
+
+def apply_offer_fields(plain, settings):
+    """-> the record with each `FIELD=VALUE` written into it (`pokeldn.sv.trade.apply_fields`)."""
+    return trade.apply_fields(plain, settings)
+
+
+def build_parser():
+    ap = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--seconds", type=float, default=240.0)
+    ap.add_argument("--phy", default="auto")
+    ap.add_argument("--channel", type=int, default=None)
+    ap.add_argument("--keys", default="~/.switch/prod.keys")
+    ap.add_argument("--capture", default=None, help="write every datagram here as JSON lines")
+    ap.add_argument("--violet", action="store_true",
+                    help="advertise Violet's local communication id instead of Scarlet's")
+    ap.add_argument("--comm-id", type=lambda v: int(v, 0), default=None,
+                    help="advertise this local communication id")
+    ap.add_argument("--app-version", type=int, default=sv.APP_VERSION)
+    ap.add_argument("--platform", type=int, default=sv.PLATFORM,
+                    help="the station platform byte: 1 is a Switch 2, which is what both retail "
+                         "consoles advertise; 0 is a Switch and what the LDN layer defaults to")
+    ap.add_argument("--ssid", default=None, help="hex, 16 bytes; default lets the LDN layer pick")
+    ap.add_argument("--ip-host", action="store_true",
+                    help="host over ldn_mitm on the LAN for an emulator; no radio and no root")
+    ap.add_argument("--our-ip", default=None)
+    ap.add_argument("--player-name", default="PkCamp", help="the LDN node name")
+    ap.add_argument("--no-net-probe", action="store_true")
+    ap.add_argument("--no-session-ack", action="store_true")
+    ap.add_argument("--no-session-response", action="store_true")
+    ap.add_argument("--no-session-update", action="store_true")
+    ap.add_argument("--join-seq", type=int, default=1)
+    ap.add_argument("--host-player-name", default="PkCamp")
+    ap.add_argument("--host-player-id", default="00000000000000020000000000000000")
+    ap.add_argument("--no-rtt", action="store_true", help="do not answer RTT requests")
+    ap.add_argument("--no-ack", action="store_true", help="do not acknowledge reliable streams")
+    ap.add_argument("--ack-period", type=float, default=1.0,
+                    help="seconds between the periodic bulk acks on every port the console used")
+    ap.add_argument("--clock", action="store_true", help="answer clone clock requests, if any")
+    ap.add_argument("--update-seq", type=int, default=1,
+                    help="the sequence id in the station-list update; a Scarlet host sends 1 where "
+                         "its join response sent 0")
+    ap.add_argument("--update-first-seq", type=int, default=None,
+                    help="also send a station list in the same breath as the join response, under "
+                         "this sequence id; an emulated Scarlet host sends one with id 0 there and "
+                         "the second about two seconds later")
+    ap.add_argument("--update-delay", type=float, default=0.0,
+                    help="seconds between the Session join response and the station-list update; a "
+                         "Scarlet host leaves about 1.5 s")
+    ap.add_argument("--session-flags", type=lambda v: int(v, 0), default=None,
+                    help="the message flags on the Session replies; a Scarlet host sends 0x00, "
+                         "this host's own default is 0x01")
+    ap.add_argument("--session-packet-id", type=int, default=0,
+                    help="the packet id in the Pia header of the Session replies; a Scarlet host's "
+                         "join response carries 1")
+    ap.add_argument("--scarlet-response", action="store_true",
+                    help="the 41-byte Session join response a Scarlet host sends, with no route "
+                         "bytes, rather than Arceus's 43-byte one")
+    ap.add_argument("--net-flags", type=lambda v: int(v, 0), default=None,
+                    help="the message flags on the Net 0x11 opening; a retail host sends 0x31, "
+                         "this host's own default is 0x01")
+    ap.add_argument("--rtt-probe", type=float, nargs="?", const=RTT_PROBE_SECONDS,
+                    default=0.0,
+                    help="send an RTT request this often, as a pair's host does every 410 ms; the "
+                         "host otherwise only answers them")
+    ap.add_argument("--net-property-flags", type=lambda v: int(v, 0), default=None,
+                    help="the message flags on the Net 0x50; a pair's host sends 0x31 on it and on "
+                         "its 0x11, and this host's 0x11 needs 0x01 to be answered at all")
+    ap.add_argument("--net-property", action="store_true",
+                    help="send the Net 0x50 update-property message a pair's host sends 0.37 s "
+                         "after its 0x11, retransmitting until the console's 0x51")
+    ap.add_argument("--net-stations", type=int, default=None,
+                    help="how many 21-byte station slots the Net 0x11 carries; a retail host "
+                         "writes four whatever the game's participant limit is")
+    ap.add_argument("--code", default="",
+                    help="the Link Code the player sets, e.g. 12345678; empty for none")
+    ap.add_argument("--game-data", help="hex, the 40 game bytes of the advertisement; a searching "
+                                        "console leaves them zero, a host that a joiner reached "
+                                        "carried 648cf4 at +0x21")
+    ap.add_argument("--send-at", action="append", default=[],
+                    help="DELAY:PROTO:PORT:HEX[:z][:start|:end], a reliable data message sent that many seconds "
+                         "after the seat; the sequence follows the port's own. A pair's host sends "
+                         "its 0x7c port 1 table update at nine seconds this way")
+    ap.add_argument("--record-set", default=None,
+                    help="a directory of NNN.bin records to send on 0x81 port 0 as this host's own "
+                         "identity, the way a pair's host sends its 46; the first carries "
+                         "INITIALIZED and every one is already zlib "
+                         "(scratchpad/sv_extract_records.py writes such a set); by default the "
+                         "recorded set in pokeldn.sv.reference")
+    ap.add_argument("--no-identity", action="store_true",
+                    help="send no station identity unless --record-set or --send-on-open names "
+                         "one; by default the recorded one in pokeldn.sv.reference")
+    ap.add_argument("--record-delay", type=float, default=0.0,
+                    help="seconds after the seat before the record set goes out")
+    ap.add_argument("--records-per-packet", type=int, default=1, metavar="N",
+                    help="bundle the record set N to a packet, each after the first with its "
+                         "header inherited, as a retail host's retransmit round does (docs/sv.md)")
+    ap.add_argument("--announce", action="store_true",
+                    help="run the game's port-2 opening from the station ids instead of a replay: "
+                         "the type-7 announcement on 0x80 port 2 carrying this host's own station "
+                         "id, and a type 9 carrying the console's in answer to its type-3 join on "
+                         "0x7c port 2 (pokeldn.sv.port2)")
+    ap.add_argument("--announce-delay", type=float, default=2.3,
+                    help="seconds after the seat before the type 7 goes out; a pair's host "
+                         "sends it at about 2.3")
+    ap.add_argument("--fresh-pid", action="store_true",
+                    help="offer each record under a new PID and encryption constant, shiny state "
+                         "kept, so a save that took it before takes it again")
+    ap.add_argument("--trade-offer", action="append", default=[],
+                    help="a file holding the 348-byte record this host offers (raw, or hex text; "
+                         "a 352-byte game message is stripped of its header). With it the host "
+                         "answers the console's offer with its own, confirms, and follows the "
+                         "console through the commit and the four exchange steps the way a pair's "
+                         "host does (pokeldn.sv.trade). Repeatable: the second and later records "
+                         "are offered in the same seat, one per trade, as each trade closes")
+    ap.add_argument("--offer-set", action="append", metavar="FIELD=VALUE", default=[],
+                    help="a field written into the offered record before it is sealed, by its "
+                         "pokeldn.sv.pokemon name: nickname=SHINY, species=906, level=50, "
+                         "ivs=31,31,31,31,31,31, pid=0x1234, trainer_id=12345, ball=4, "
+                         "moves=33,0,0,0. Repeatable, and `shiny` alone rolls a personality value "
+                         "shiny against the record's own ids")
+    ap.add_argument("--offer-dump", default=None,
+                    help="write the offered record's 348-byte body to this file as hex and exit, "
+                         "which needs no radio")
+    ap.add_argument("--offer-out", default=None,
+                    help="a file to write the console's own offer to, the 348-byte body of its "
+                         "80 00 02 00 message, as hex text. What it holds is read by "
+                         "pokeldn.sv.pokemon")
+    ap.add_argument("--send-on-open", action="append", default=[],
+                    help="DELAY:PROTO:PORT:HEX[:z][:start|:end], sent that many seconds after the "
+                         "console announces its own key 0x80 open on 0x7c port 1. A port-0 "
+                         "message sent before that open is acknowledged by the console and never "
+                         "reaches the game, and so is everything after it on that port; "
+                         "repeatable; by default the identity fragments in pokeldn.sv.reference")
+    ap.add_argument("--offer-after-open", type=float, default=None,
+                    help="seconds after the console's key-0x80 open at which the host offers "
+                         "first; the same gate as --send-on-open")
+    ap.add_argument("--offer-at", type=float, default=None,
+                    help="seconds after the seat at which the host offers first, before the "
+                         "console does, as a pair's host did; without it the host answers the "
+                         "console's offer")
+    ap.add_argument("--confirm-delay", type=float, default=1.0,
+                    help="seconds after the console's offer before the host's confirmation")
+    ap.add_argument("--send", action="append", default=[],
+                    help="PROTO:PORT:HEX, a reliable data message to send once the console has "
+                         "joined (host seq 1 on that port, INITIALIZED); repeatable")
+    return ap
+
+
+def main():
+    ap = build_parser()
+    args = ap.parse_args()
+    if args.trade_offer:
+        args.trade_offer = [pokemon_service.prepare_file("sv", p, fresh=args.fresh_pid,
+            transform=lambda raw: trade.load_offer(raw, args.offer_set)) for p in args.trade_offer]
+        args.offer_set = []
+        args.fresh_pid = False
+    reference.fill_identity(args)
+    try:
+        host_player_id = binascii.unhexlify(args.host_player_id)
+    except binascii.Error:
+        ap.error("--host-player-id must be hex")
+    if len(host_player_id) != 16:
+        ap.error("--host-player-id must be 16 bytes")
+    if not args.ip_host and not args.offer_dump and needs_root():
+        ap.error("hosting over the radio needs root; re-run under sudo, or pass --ip-host")
+    comm_id = args.comm_id or (sv.COMM_ID_VIOLET if args.violet else sv.COMM_ID_SCARLET)
+
+    phy = None
+    if not args.ip_host:
+        phy = find_ap_phy(log=print) if args.phy == "auto" else args.phy
+        if phy is None:
+            print("[sv] no AP-capable phy")
+            return 1
+
+    session_flags = (ESTABLISHING_FLAGS if args.session_flags is None else args.session_flags)
+    pending_update = {}
+    pending_records = {}
+    pending_late = {}
+    pending_trade = []          # (due, ip, port, payload) the trade stage asked to send
+
+    def schedule_trade(delay, ip, port, payload):
+        """Queue after any message already queued for this station and port: a station that
+        confirms a trade before its own record is on the wire crashes the game (docs/sv.md)."""
+        due = time.time() + delay
+        for other in pending_trade:
+            if other[1] == ip and other[2] == port:
+                due = max(due, other[0] + delay)
+        pending_trade.append((due, ip, port, payload))
+    stages = {}
+    offers_seen = {}
+    trades_done = {}
+    trade_offers = []
+    if args.trade_offer:
+        # A wrong size raises here, before the radio is up.
+        for path in args.trade_offer:
+            one = trade.load_offer(Path(path).read_bytes(), args.offer_set,
+                                   fresh=args.fresh_pid)
+            trade_offers.append(one)
+            try:
+                print(f"[sv] offer {len(trade_offers)} of {len(args.trade_offer)}: "
+                      f"{pokemon.describe(pokemon.from_wire(one))}")
+            except ValueError as exc:
+                print(f"[sv] offering {len(one)} bytes, which do not read as a record: {exc}")
+        if args.offer_dump:
+            with open_output(args.offer_dump, "w") as fh:
+                for one in trade_offers:
+                    fh.write(one.hex() + "\n")
+            print(f"[sv] offer written to {args.offer_dump}")
+            return 0
+    elif args.offer_set or args.offer_dump:
+        ap.error("--offer-set and --offer-dump need --trade-offer")
+    def report_offer(ip, body, n):
+        try:
+            print(f"[sv] {ip}: offers {pokemon.describe(pokemon.from_wire(body))}")
+        except ValueError as exc:
+            print(f"[sv] {ip}: offered {len(body)} bytes that do not read as a record: {exc}")
+        if args.offer_out:
+            path = args.offer_out if n == 1 else f"{args.offer_out}.{n}"
+            pokemon_service.save_received("sv", path, body)
+            print(f"[sv] {ip}: offer written to {path}")
+
+    game_data = binascii.unhexlify(args.game_data) if args.game_data else None
+    if args.code and game_data is None:
+        game_data = sv.build_game_data(args.code)   # the Net property carries it too
+    app_data = sv.build_advertise_data(game_data=game_data, code=args.code)
+    print(f"[sv] advertising comm id {comm_id:#018x}, {len(app_data)} bytes of application data, "
+          f"platform {args.platform}")
+    machine = config.load_project_host_file_config()
+    factory = IpHostTransport if args.ip_host else HostTransport
+    transport = factory(
+        app_data=app_data, password=sv.PASSPHRASE, nickname=args.player_name,
+        keys_path=resolve_keys(args.keys), local_comm_id=comm_id, scene_id=sv.SCENE_ID,
+        app_version=args.app_version, max_participants=sv.MAX_PARTICIPANTS, phyname=phy,
+        channel=args.channel, protocol=sv.LDN_PROTOCOL,
+        ssid=binascii.unhexlify(args.ssid) if args.ssid else None,
+        # ldn_mitm carries neither the platform byte nor the radio profile.
+        **({"mirror_comm_version": True} if args.ip_host else {}),
+        **({"our_ip": args.our_ip} if args.ip_host and args.our_ip else {}),
+        **({} if args.ip_host else dict(platform=args.platform,
+                                        skip_encryption=machine.skip_encryption,
+                                        accept_decrypted_ccmp=machine.accept_decrypted_ccmp)))
+    if not args.ip_host:
+        print(f"[sv] radio profile: skip_encryption={machine.skip_encryption} "
+              f"accept_decrypted_ccmp={machine.accept_decrypted_ccmp}")
+
+    cap = open_output(args.capture, "w") if args.capture else None
+
+    def record(**row):
+        if cap:
+            cap.write(json.dumps(row) + "\n")
+            cap.flush()
+
+    try:
+        transport.start()
+    except RuntimeError as exc:
+        print(f"[sv] the network did not come up: {exc}")
+        return 2
+
+    keys = sv.session_keys(transport.ssid)
+    print(f"[sv] ssid={transport.ssid.hex()} network_id={keys.network_id:#010x} us={transport.our_ip}")
+    record(rec="host", ssid=transport.ssid.hex(), network_id=keys.network_id,
+           our_ip=transport.our_ip, comm_id=comm_id, app_data=app_data.hex())
+
+    deadline = time.time() + args.seconds
+    seen, authed, failed = 0, 0, 0
+    net_seqid, net_sent, seen_ips = 2, {}, set()
+    net_prop = {}              # src_ip -> [seqid, when it last went out, acknowledged]
+    rtt_sent = {}              # src_ip -> when the last RTT request went out
+    net_answered = set()
+
+    station_ids = {}
+    stream_high = {}
+    host_seq = {}
+    last_ack = {}
+    sent_once = set()           # (src_ip, index of --send) already sent
+    counts = {}
+    advertised_players = [1]
+
+    def next_seq(src_ip, protocol, port):
+        s = host_seq.get((src_ip, protocol, port), 1)
+        host_seq[(src_ip, protocol, port)] = s + 1
+        return s
+
+    def send_data(ip, protocol, port, data, why):
+        seq = next_seq(ip, protocol, port)
+        flags = (reliable5.FLAG_APPLICATION_DATA | reliable5.FLAG_MESSAGE_START
+                 | reliable5.FLAG_MESSAGE_END
+                 | (reliable5.FLAG_IS_INITIALIZED if seq == 1 else 0))
+        body = build_reliable_body(protocol, flags, seq, data)
+        pkt = build_reply(keys, transport.our_ip, body, station_ids[ip]["console_var"],
+                          os.urandom(8), protocol=protocol, port=port, flags=0)
+        transport.send(pkt, ip)
+        record(rec="out", dst=ip, kind=why, protocol=protocol, port=port, seq=seq,
+               hex=pkt.hex(), t=time.time())
+        print(f"[sv] -> {ip}: data 0x{protocol:02x}:{port} seq {seq} {len(data)}B "
+              f"{data[:8].hex()} ({why})")
+
+    def send_record_bundle(ip, bundle):
+        """The first message whole, the rest inheriting its header."""
+        msgs = pia6.build_message(bundle[0][1], PROTO_STREAM_BROADCAST_RELIABLE)
+        msgs += b"".join(pia6.build_message(body, PROTO_STREAM_BROADCAST_RELIABLE, inherit=True)
+                         for _, body in bundle[1:])
+        pkt = pia6.build_packet(keys.session_key, keys.network_id, transport.our_ip, msgs,
+                                dst_var=MESH_DESTINATION, src_var=PIA_HOST_VAR,
+                                nonce8=os.urandom(8), footer_ids=(station_ids[ip]["console_var"],))
+        transport.send(pkt, ip)
+        for seq, _ in bundle:
+            record(rec="out", dst=ip, kind="record set", protocol=0x81, port=0, seq=seq,
+                   hex=pkt.hex(), t=time.time())
+
+    def send_ack(src_ip, protocol, port, dst_var, why):
+        high = stream_high.get((src_ip, protocol, port), 0)
+        if protocol == PROTO_RELIABLE:
+            # 0x7C takes the one-entry ack, and its lowest pending is the host's own next sequence:
+            # a higher one makes the console drop our next message at 0x6f03cc, the commit
+            # (docs/sv.md, Hosting for a console).
+            body = game_channel.build_ack(
+                high + 1, lowest_pending=host_seq.get((src_ip, protocol, port), 1))
+        else:
+            body = build_bulk_ack({CONSOLE_STATION_INDEX: high},
+                                  host_seq.get((src_ip, protocol, port), 1))
+        pkt = build_reply(keys, transport.our_ip, body, dst_var, os.urandom(8),
+                          protocol=protocol, port=port, flags=0)
+        transport.send(pkt, src_ip)
+        last_ack[(src_ip, protocol, port)] = time.time()
+        record(rec="out", dst=src_ip, kind="reliable ack", protocol=protocol, port=port,
+               ack_id=high + 1, hex=pkt.hex(), t=time.time())
+        print(f"[sv] -> {src_ip}: ack 0x{protocol:02x}:{port} ack_id {high + 1} ({why})")
+
+    try:
+        while time.time() < deadline:
+            now = time.time()
+            current_ips = set()
+            for entry in list(transport.participants):
+                seen_ips.add(entry[1])
+                current_ips.add(entry[1])
+            # The Pia block's player count, not the LDN list, is the session the game sees. A
+            # returning station needs the Net 0x11 again.
+            net_answered.intersection_update(current_ips)
+            players = 1 + len(transport.participants)
+            if players != advertised_players[0]:
+                advertised_players[0] = players
+                transport.set_application_data(
+                    sv.build_advertise_data(num_players=players, game_data=game_data,
+                                            code=args.code))
+                print(f"[sv] advertising {players} player(s)")
+            if not args.no_net_probe:
+                for ip in list(seen_ips):
+                    # A retail host sends Net 0x11 once; a repeat is a fresh connection request.
+                    if ip in net_answered:
+                        continue
+                    if ip == transport.our_ip or now - net_sent.get(ip, 0) < NET_REPEAT_SECONDS:
+                        continue
+                    net_sent[ip] = now
+                    net_seqid += 1
+                    probe = build_net_probe(
+                        keys, transport.our_ip, transport.our_mac, [transport.our_ip, ip],
+                        net_seqid, os.urandom(8),
+                        sv.MAX_PARTICIPANTS if args.net_stations is None else args.net_stations,
+                        net_flags=(ESTABLISHING_FLAGS if args.net_flags is None
+                                   else args.net_flags))
+                    transport.send(probe, ip)
+                    record(rec="out", dst=ip, kind="net conn request", seqid=net_seqid,
+                           hex=probe.hex(), t=now)
+                    print(f"[sv] -> {ip}: net 0x11 connection request, seqid={net_seqid}")
+            if args.rtt_probe:
+                for ip in list(seen_ips):
+                    if ip == transport.our_ip or now - rtt_sent.get(ip, 0) < args.rtt_probe:
+                        continue
+                    rtt_sent[ip] = now
+                    tick = int(time.monotonic() * RTT_TICKS_PER_SECOND)
+                    pkt = build_reply(keys, transport.our_ip,
+                                      build_rtt(RTT_REQUEST, tick),
+                                      station_ids.get(ip, {}).get("console_var", 0),
+                                      os.urandom(8), protocol=PROTO_RTT)
+                    transport.send(pkt, ip)
+                    record(rec="out", dst=ip, kind="rtt request", hex=pkt.hex(), t=now)
+            if args.net_property:
+                for ip, state in list(net_prop.items()):
+                    if state[2] or now - state[1] < NET_REPEAT_SECONDS:
+                        continue
+                    state[1] = now
+                    pkt = build_net_property(keys, transport.our_ip, state[0], os.urandom(8),
+                                             game_data=game_data,
+                                             net_flags=(ESTABLISHING_FLAGS
+                                                        if args.net_property_flags is None
+                                                        else args.net_property_flags))
+                    transport.send(pkt, ip)
+                    record(rec="out", dst=ip, kind="net property", seqid=state[0],
+                           hex=pkt.hex(), t=now)
+                    print(f"[sv] -> {ip}: net 0x50 update property, seqid={state[0]}")
+            for entry in list(pending_trade):
+                due, ip, port, payload = entry
+                if now < due:
+                    continue
+                pending_trade.remove(entry)
+                if ip in station_ids:
+                    send_data(ip, PROTO_RELIABLE, port, payload, "trade")
+            for (ip, index), (due, rest) in list(pending_late.items()):
+                if now < due or ip not in station_ids:
+                    continue
+                del pending_late[(ip, index)]
+                p_, port_, hx = rest.split(":", 2)
+                data, flags = parse_send_payload(hx)
+                p_, port_ = int(p_, 0), int(port_)
+                seq = next_seq(ip, p_, port_)
+                flags |= reliable5.FLAG_IS_INITIALIZED if seq == 1 else 0
+                body = build_reliable_body(p_, flags, seq, data)
+                pkt = build_reply(keys, transport.our_ip, body, station_ids[ip]["console_var"],
+                                  os.urandom(8), protocol=p_, port=port_, flags=0)
+                transport.send(pkt, ip)
+                record(rec="out", dst=ip, kind="send-at", protocol=p_, port=port_, seq=seq,
+                       hex=pkt.hex(), t=now)
+                print(f"[sv] -> {ip}: data 0x{p_:02x}:{port_} seq {seq} {len(data)}B (scheduled)")
+            for ip, due in list(pending_records.items()):
+                if now < due or ip not in station_ids:
+                    continue
+                del pending_records[ip]
+                # An `order` file names the send order, one id a line; retail is not ascending
+                # (docs/sv.md).
+                sent_ids, bundle = [], []
+                order_path = os.path.join(args.record_set, "order")
+                if os.path.exists(order_path):
+                    names = [f"{int(line):03d}.bin" for line in open(order_path)
+                             if line.strip()]
+                else:
+                    names = sorted(os.listdir(args.record_set))
+                for name in names:
+                    if not name.endswith(".bin"):
+                        continue
+                    path = os.path.join(args.record_set, name)
+                    if not os.path.exists(path):
+                        continue
+                    payload = Path(path).read_bytes()
+                    seq = int(name.split(".")[0])
+                    flags = (reliable5.FLAG_APPLICATION_DATA | reliable5.FLAG_MESSAGE_START
+                             | reliable5.FLAG_MESSAGE_END | reliable5.FLAG_ZLIB
+                             | (reliable5.FLAG_IS_INITIALIZED if seq == 1 else 0))
+                    body = build_reliable_body(PROTO_STREAM_BROADCAST_RELIABLE, flags, seq,
+                                               payload, lowest_pending=1)
+                    # Under the console's receive limit.
+                    if bundle and (len(bundle) >= args.records_per_packet or sum(
+                            len(b) + 3 for _, b in bundle) + len(body) + 3 > pia6.MAX_PAYLOAD - 48):
+                        send_record_bundle(ip, bundle)
+                        bundle = []
+                    bundle.append((seq, body))
+                    sent_ids.append(seq)
+                if bundle:
+                    send_record_bundle(ip, bundle)
+                # One past the last id sent tells the peer the gap at 5 and 6 never fills; left at 1
+                # it waits for 5 all session (docs/sv.md).
+                if sent_ids:
+                    host_seq[(ip, PROTO_STREAM_BROADCAST_RELIABLE, 0)] = max(sent_ids) + 1
+                print(f"[sv] -> {ip}: identity, {len(names)} record(s) on 0x81 port 0, "
+                      f"lowest pending now {max(sent_ids) + 1 if sent_ids else 1}")
+            for ip, (due, pkt) in list(pending_update.items()):
+                if now >= due:
+                    del pending_update[ip]
+                    transport.send(pkt, ip)
+                    record(rec="out", dst=ip, kind="session update", hex=pkt.hex(), t=now)
+                    print(f"[sv] -> {ip}: session station-list update (type 5)")
+            if not args.no_ack:
+                for (ip, protocol, port), at in list(last_ack.items()):
+                    if now - at >= args.ack_period and ip in station_ids:
+                        send_ack(ip, protocol, port, station_ids[ip]["console_var"], "periodic")
+            transport.wait_readable(0.05)
+            for payload, src_ip in transport.recv():
+                seen += 1
+                record(rec="in", src=src_ip, hex=payload.hex(), t=time.time())
+                if not pia6.is_pia6(payload):
+                    print(f"[sv] {src_ip}: not a version-11 packet, {payload[:8].hex()}")
+                    continue
+                header, plain, ids = pia6.parse_packet(keys.session_key, src_ip,
+                                                       keys.network_id, payload)
+                if plain is None:
+                    failed += 1
+                    print(f"[sv] {src_ip}: {header!r} DID NOT AUTHENTICATE")
+                    continue
+                authed += 1
+                try:
+                    msgs = list(pia6.parse_messages(plain))
+                except Exception as exc:
+                    print(f"[sv] {src_ip}: {header!r} messages did not parse: {exc} {plain.hex()}")
+                    continue
+                for msg in msgs:
+                    counts[msg.protocol] = counts.get(msg.protocol, 0) + 1
+                    print(f"[sv] <- {src_ip} {header!r} footer={ids}")
+                    print(f"       {_describe(msg)}  {msg.payload.hex()}")
+                    record(rec="msg", src=src_ip, protocol=msg.protocol, port=msg.port,
+                           flags=msg.message_flags, src_var=header.src_var, dst_var=header.dst_var,
+                           payload=msg.payload.hex(), t=time.time())
+                    try:
+                        if msg.protocol == PROTO_NET and len(msg.payload) >= 8:
+                            kind = msg.payload[1]
+                            if kind == pia_connect.NET_CONN_RESPONSE:
+                                net_answered.add(src_ip)
+                            if (args.net_property and kind == pia_connect.NET_CONN_RESPONSE
+                                    and src_ip not in net_prop):
+                                net_prop[src_ip] = [1, 0.0, False]
+                            elif (args.net_property and kind == NET_PROPERTY_ACK
+                                  and src_ip in net_prop):
+                                acked = int.from_bytes(msg.payload[4:8], "big")
+                                if acked == net_prop[src_ip][0]:
+                                    net_prop[src_ip][2] = True
+                                    print(f"[sv] {src_ip}: acknowledged net 0x50 with 0x51, "
+                                          f"seqid={acked}")
+                        if (msg.protocol == PROTO_SESSION and msg.payload
+                                and msg.payload[0] == SESSION_JOIN_REQUEST):
+                            if args.net_property:
+                                # A rejoin re-arms the property; re-arming on Net 0x12 would never
+                                # stop, since the 0x11 repeats.
+                                previous = net_prop.get(src_ip, [0, 0.0, True])
+                                if previous[2]:
+                                    net_prop[src_ip] = [previous[0] + 1, 0.0, False]
+                            j = pia_connect.parse_session_join_v11(msg.payload)
+                            if j is None:
+                                print(f"[sv] {src_ip}: join request did not parse")
+                                continue
+                            print(f"[sv] {src_ip}: join request: protocols "
+                                  + " ".join(f"0x{p:02x}v{v}" for p, v in j["protocols"])
+                                  + f" app_version={j.get('application_version')!r}")
+                            record(rec="join", src=src_ip, parsed={k: (v.hex() if isinstance(v, bytes) else v)
+                                                                   for k, v in j.items()}, t=time.time())
+                            for d in (stream_high, host_seq, last_ack):
+                                for k in [k for k in d if k[0] == src_ip]:
+                                    d.pop(k)
+                            sent_once = {s for s in sent_once if s[0] != src_ip}
+                            stages.pop(src_ip, None)
+                            pending_trade[:] = [e for e in pending_trade if e[1] != src_ip]
+                            net_answered.discard(src_ip)
+                            host_const, host_var = j["destination_constant_id"], j["destination_var"]
+                            console_const, console_var = j["source_constant_id"], j["source_var"]
+                            station_ids[src_ip] = dict(host_const=host_const, host_var=host_var,
+                                                       console_const=console_const,
+                                                       console_var=console_var, at=time.time())
+                            version = dict(j["protocols"]).get(PROTO_SESSION, 0)
+                            if not args.no_session_ack:
+                                ack = pia_connect.build_session_join_ack_v11(
+                                    host_const, host_var, console_const, console_var)
+                                pkt = build_reply(keys, transport.our_ip, ack, console_var,
+                                                  os.urandom(8), flags=session_flags,
+                                                  packet_id=args.session_packet_id)
+                                transport.send(pkt, src_ip)
+                                record(rec="out", dst=src_ip, kind="session join ack", hex=pkt.hex(),
+                                       t=time.time())
+                                print(f"[sv] -> {src_ip}: session join-request-ack (type 1)")
+                            if not args.no_session_response:
+                                resp = pia_connect.build_session_join_response_v11(
+                                    host_const, host_var, console_const, console_var,
+                                    version=version, sequence_id=args.join_seq,
+                                    route=None if args.scarlet_response else (0, 1),
+                                    random4=os.urandom(4))
+                                pkt = build_reply(keys, transport.our_ip, resp, console_var,
+                                                  os.urandom(8), flags=session_flags,
+                                                  packet_id=args.session_packet_id)
+                                transport.send(pkt, src_ip)
+                                record(rec="out", dst=src_ip, kind="session join response",
+                                       hex=pkt.hex(), t=time.time())
+                                print(f"[sv] -> {src_ip}: session join response (type 2)")
+                            if not args.no_session_update:
+                                host_player = dict(player_id=host_player_id, name=args.host_player_name)
+                                console_player = dict(player_id=pia_connect.DEFAULT_PLAYER_ID, name=" ")
+                                stations = [
+                                    dict(constant_id=host_const, variable_id=host_var,
+                                         ip=transport.our_ip, port=12345, station_index=0,
+                                         route=None if args.scarlet_response else (0, 0),
+                                         join_order=0, token=b"\x00" * 32,
+                                         players=[host_player]),
+                                    dict(constant_id=console_const, variable_id=console_var,
+                                         ip=src_ip, port=j["port"], station_index=1,
+                                         route=None if args.scarlet_response else (0, 1),
+                                         join_order=1, token=j["identification_token"],
+                                         players=[console_player]),
+                                ]
+                                # An emulated host sends the list twice; a retail console leaves
+                                # when sent a type-1 join ack in that breath (docs/sv.md).
+                                if args.update_first_seq is not None:
+                                    first = pia_connect.build_session_update_v11(
+                                        host_const, host_var, stations,
+                                        sequence_id=args.update_first_seq)
+                                    pkt0 = build_reply(keys, transport.our_ip, first, console_var,
+                                                       os.urandom(8), flags=session_flags,
+                                                       packet_id=args.session_packet_id)
+                                    transport.send(pkt0, src_ip)
+                                    record(rec="out", dst=src_ip, kind="session update",
+                                           seq=args.update_first_seq, hex=pkt0.hex(), t=time.time())
+                                    print(f"[sv] -> {src_ip}: session station list (type 5), "
+                                          f"sequence {args.update_first_seq}, in the same breath")
+                                upd = pia_connect.build_session_update_v11(
+                                    host_const, host_var, stations, sequence_id=args.update_seq)
+                                pkt = build_reply(keys, transport.our_ip, upd, console_var,
+                                                  os.urandom(8), flags=session_flags,
+                                                  packet_id=args.session_packet_id)
+                                # The station list goes ~1.5 s after the type 2: sent together, the
+                                # console takes neither.
+                                pending_update[src_ip] = (time.time() + args.update_delay, pkt)
+                            if args.record_set and src_ip not in pending_records:
+                                pending_records[src_ip] = time.time() + args.record_delay
+                            for index, spec in enumerate(args.send_at):
+                                if (src_ip, index) in pending_late:
+                                    continue
+                                delay, rest = spec.split(":", 1)
+                                pending_late[(src_ip, index)] = (time.time() + float(delay), rest)
+                            if trade_offers and args.offer_at is not None:
+                                stages[src_ip] = trade.TradeStage(
+                                    trade_offers, confirm_delay=args.confirm_delay)
+                                for delay, out_port, payload in stages[src_ip].offer_first():
+                                    schedule_trade(args.offer_at + delay,
+                                                   src_ip, out_port, payload)
+                            if args.announce and (src_ip, "announce") not in pending_late:
+                                # The type 7 names this host's station, the join's constant id read
+                                # big-endian.
+                                body = port2.build_announce(port2.station_id(host_const))
+                                pending_late[(src_ip, "announce")] = (
+                                    time.time() + args.announce_delay,
+                                    f"0x80:2:{port2.deflate_announce(body).hex()}:z")
+                        if (not args.no_rtt and msg.protocol == PROTO_RTT and msg.payload
+                                and msg.payload[0] == RTT_REQUEST):
+                            # The response's target is the requester's variable id; the request
+                            # carries zero.
+                            target = station_ids.get(src_ip, {}).get("console_var", 0)
+                            echo = (bytes([RTT_RESPONSE]) + msg.payload[1:9]
+                                    + struct.pack(">H", target & 0xFFFF)
+                                    if len(msg.payload) >= 11
+                                    else bytes([RTT_RESPONSE]) + msg.payload[1:])
+                            pkt = build_reply(keys, transport.our_ip, echo, header.src_var,
+                                              os.urandom(8), protocol=PROTO_RTT)
+                            transport.send(pkt, src_ip)
+                            record(rec="out", dst=src_ip, kind="rtt response", hex=pkt.hex(), t=time.time())
+                        if (args.clock and msg.protocol == PROTO_CLONE_CLOCK and len(msg.payload) >= 18
+                                and msg.payload[0] == 0):
+                            host_ms = int(time.monotonic() * 1000) & ((1 << 64) - 1)
+                            reply = (bytes([1]) + msg.payload[1:2] + msg.payload[2:10]
+                                     + host_ms.to_bytes(8, "big"))
+                            pkt = build_reply(keys, transport.our_ip, reply, header.src_var,
+                                              os.urandom(8), protocol=PROTO_CLONE_CLOCK)
+                            transport.send(pkt, src_ip)
+                            record(rec="out", dst=src_ip, kind="clone clock reply", hex=pkt.hex(), t=time.time())
+                        if (msg.protocol in RELIABLE_PROTOCOLS
+                                and len(msg.payload) >= reliable5.HEADER_SIZE):
+                            try:
+                                rm = reliable5.parse(msg.payload)
+                            except ValueError as exc:
+                                print(f"[sv] {src_ip}: reliable did not parse: {exc}")
+                                rm = None
+                            key = (src_ip, msg.protocol, msg.port)
+                            if rm and (rm["flags"] & reliable5.FLAG_APPLICATION_DATA):
+                                print(f"[sv] <- {src_ip}: DATA 0x{msg.protocol:02x}:{msg.port} "
+                                      f"stream {rm['stream_id']} seq {rm['sequence_id']} "
+                                      f"{reliable5.flag_names(rm['flags'])} bits={rm['destination_bits']} "
+                                      f"map={rm['bitmap']} {len(rm['payload'])}B "
+                                      f"{rm['payload'].hex()}")
+                                record(rec="data", src=src_ip, protocol=msg.protocol, port=msg.port,
+                                       seq=rm["sequence_id"], flags=rm["flags"],
+                                       payload=rm["payload"].hex(), t=time.time())
+                                stream_high[key] = max(stream_high.get(key, 0), rm["sequence_id"])
+                                if not args.no_ack and src_ip in station_ids:
+                                    send_ack(src_ip, msg.protocol, msg.port,
+                                             station_ids[src_ip]["console_var"],
+                                             f"seq {rm['sequence_id']}")
+                                if (trade_offers and msg.protocol == PROTO_RELIABLE
+                                        and src_ip in station_ids):
+                                    if src_ip not in stages:
+                                        stages[src_ip] = trade.TradeStage(
+                                            trade_offers, confirm_delay=args.confirm_delay)
+                                    st = stages[src_ip]
+                                    for delay, out_port, payload in st.on_message(
+                                            msg.port, rm["payload"]):
+                                        schedule_trade(delay, src_ip, out_port, payload)
+                                    while offers_seen.get(src_ip, 0) < len(st.joiner_offers):
+                                        n = offers_seen.get(src_ip, 0) + 1
+                                        offers_seen[src_ip] = n
+                                        report_offer(src_ip, st.joiner_offers[n - 1], n)
+                                    if st.trades > trades_done.get(src_ip, 0):
+                                        trades_done[src_ip] = st.trades
+                                        show_done()
+                                        if st.done:
+                                            print(f"[sv] {src_ip}: TRADE {st.trades} COMPLETE; "
+                                                  f"no record left to offer")
+                                        else:
+                                            print(f"[sv] {src_ip}: TRADE {st.trades} COMPLETE; "
+                                                  f"offering the next record")
+                                            if args.offer_after_open is not None \
+                                                    or args.offer_at is not None:
+                                                lead = (args.offer_after_open
+                                                        if args.offer_after_open is not None
+                                                        else args.offer_at)
+                                                for delay, out_port, payload in st.offer_first():
+                                                    schedule_trade(lead + delay, src_ip,
+                                                                   out_port, payload)
+                                if (msg.protocol == PROTO_RELIABLE and msg.port == 1
+                                        and src_ip in station_ids
+                                        and rm["payload"] == trade.table_update(trade.KEY_TRADE, True)
+                                        and (src_ip, "open") not in sent_once):
+                                    # Nothing on port 0 reaches the game before the console's
+                                    # trade-key open.
+                                    sent_once.add((src_ip, "open"))
+                                    print(f"[sv] {src_ip}: opened key 0x80, "
+                                          f"{len(args.send_on_open)} send(s) follow")
+                                    for index, spec in enumerate(args.send_on_open):
+                                        delay, rest = spec.split(":", 1)
+                                        pending_late[(src_ip, f"open{index}")] = (
+                                            time.time() + float(delay), rest)
+                                    if trade_offers and args.offer_after_open is not None:
+                                        stages.setdefault(src_ip, trade.TradeStage(
+                                            trade_offers, confirm_delay=args.confirm_delay))
+                                        for delay, out_port, payload in stages[src_ip].offer_first():
+                                            schedule_trade(args.offer_after_open + delay,
+                                                           src_ip, out_port, payload)
+                                slot = (port2.parse_join(rm["payload"])
+                                        if msg.protocol == PROTO_RELIABLE and msg.port == 2
+                                        else None)
+                                if (args.announce and slot is not None and src_ip in station_ids
+                                        and (src_ip, "accept") not in sent_once):
+                                    # The type 9 carries the joiner's station id; the receiver drops
+                                    # any other.
+                                    sent_once.add((src_ip, "accept"))
+                                    data = port2.build_accept(
+                                        port2.station_id(station_ids[src_ip]["console_const"]),
+                                        slot=slot)
+                                    s2 = next_seq(src_ip, 0x80, 2)
+                                    flags = (reliable5.FLAG_APPLICATION_DATA
+                                             | reliable5.FLAG_MESSAGE_START
+                                             | reliable5.FLAG_MESSAGE_END
+                                             | (reliable5.FLAG_IS_INITIALIZED if s2 == 1 else 0))
+                                    body = build_reliable_body(0x80, flags, s2, data)
+                                    pkt = build_reply(keys, transport.our_ip, body,
+                                                      station_ids[src_ip]["console_var"],
+                                                      os.urandom(8), protocol=0x80, port=2, flags=0)
+                                    transport.send(pkt, src_ip)
+                                    record(rec="out", dst=src_ip, kind="accept", protocol=0x80,
+                                           port=2, seq=s2, hex=pkt.hex(), t=time.time())
+                                    print(f"[sv] -> {src_ip}: type 9 accept on 0x80:2 seq {s2}, "
+                                          f"slot {slot}, station {data[-8:].hex()}")
+                            elif rm:
+                                a = reliable5.parse_ack_payload(rm["payload"])
+                                print(f"[sv] <- {src_ip}: ACK 0x{msg.protocol:02x}:{msg.port} "
+                                      f"low={rm['lowest_pending']} bits={rm['destination_bits']} "
+                                      f"map={rm['bitmap']} u0={a['unknown0']} "
+                                      + " ".join(f"[s{e['stream_id']} ack={e['ack_id']} f={e['field_0x50']}]"
+                                                 for e in a["entries"]))
+                                if (not args.no_ack and src_ip in station_ids
+                                        and key not in last_ack):
+                                    send_ack(src_ip, msg.protocol, msg.port,
+                                             station_ids[src_ip]["console_var"], "first")
+                            if src_ip in station_ids:
+                                for index, spec in enumerate(args.send):
+                                    if (src_ip, index) in sent_once:
+                                        continue
+                                    sent_once.add((src_ip, index))
+                                    p, port, hx = spec.split(":", 2)
+                                    data, flags = parse_send_payload(hx)
+                                    p, port = int(p, 0), int(port)
+                                    s = next_seq(src_ip, p, port)
+                                    flags |= reliable5.FLAG_IS_INITIALIZED if s == 1 else 0
+                                    body = build_reliable_body(p, flags, s, data)
+                                    pkt = build_reply(keys, transport.our_ip, body, header.src_var,
+                                                      os.urandom(8), protocol=p, port=port, flags=0)
+                                    transport.send(pkt, src_ip)
+                                    record(rec="out", dst=src_ip, kind="send", protocol=p, port=port,
+                                           seq=s, hex=pkt.hex(), t=time.time())
+                                    print(f"[sv] -> {src_ip}: data 0x{p:02x}:{port} seq {s} {len(data)}B")
+                    except Exception:
+                        print(f"[sv] {src_ip}: the message handler raised, still serving")
+                        traceback.print_exc()
+    except KeyboardInterrupt:
+        print("\n[sv] interrupted")
+    finally:
+        transport.stop()
+        if cap:
+            cap.close()
+
+    print(f"[sv] {seen} datagram(s) in, {authed} authenticated, {failed} not. "
+          f"joins={transport.join_events}")
+    print("[sv] messages by protocol: "
+          + " ".join(f"0x{p:02x}={n}" for p, n in sorted(counts.items())))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

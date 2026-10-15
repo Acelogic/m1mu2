@@ -1,0 +1,160 @@
+"""Union Room 'do something' prompt: SEND_PACKETs [union_room.c:2928, :2955] answered with ACCEPT /
+DECLINE [union_room.c:3151]."""
+import os
+import sys
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+
+from pokeldn.frlg.link import trade  # noqa: E402
+from pokeldn.frlg.save import mon  # noqa: E402
+from pokeldn.gba import rfu  # noqa: E402
+from pokeldn.frlg.link.host_trade import H_ENTRY_CARD, H_UROOM_PROMPT, HostTradeEngine  # noqa: E402
+
+
+def _mon(marker):
+    return mon.Mon(bytes([marker & 0xFF]) + b"\x00" * 99)
+
+
+def _engine(union_room=True):
+    h = HostTradeEngine([_mon(1)], union_room=union_room)
+    h._words.clear()
+    h._begin_card_exchange()
+    h._words.clear()
+    h._blocks.clear()
+    h._expected = "card"
+    return h
+
+
+def _packet_slot(*words):
+    # The child stamps its rolling tag in word0's low byte; parse_slot masks it off.
+    slot = bytearray(rfu.serialize(rfu.send_packet_words(list(words))))
+    slot[0] |= 0x60
+    return bytes(slot)
+
+
+def _queued_packets(h):
+    return [w[1] for w in h._words if w[0] == rfu.SEND_PACKET]
+
+
+def test_send_packet_round_trips_through_rfu():
+    words = rfu.send_packet_words([0x51])
+    assert words == [rfu.SEND_PACKET, 0x51, 0, 0, 0, 0, 0]
+    rec = rfu.parse_slot(_packet_slot(0x48))
+    assert rec["op"] == rfu.SEND_PACKET and rec["packet"] == [0x48, 0, 0, 0, 0, 0]
+
+
+def test_card_block_moves_a_union_room_host_to_the_prompt():
+    h = _engine()
+    h._after_child_block(trade.COUNT_TRAINER_CARD, bytes(range(100)))
+    assert h.state == H_UROOM_PROMPT and h._expected is None
+    assert h.child_card == bytes(range(100))
+
+
+def test_card_block_keeps_the_trade_centre_path_without_the_option():
+    h = _engine(union_room=False)
+    h._after_child_block(trade.COUNT_TRAINER_CARD, bytes(100))
+    assert h.state == H_ENTRY_CARD and h._expected == "warp1"
+
+
+def test_greetings_request_is_accepted_and_the_standby_echoed():
+    h = _engine()
+    h._after_child_block(trade.COUNT_TRAINER_CARD, bytes(100))
+    h.feed_child_slot(_packet_slot(0x48))
+    assert _queued_packets(h) == [0x51] * HostTradeEngine.UR_PACKET_REPEAT
+    assert h.uroom_requests == [(0x48, 0, 0, 0, 0, 0)]
+    h.feed_child_slot(_packet_slot(0x48))
+    assert len(_queued_packets(h)) == HostTradeEngine.UR_PACKET_REPEAT
+    # A second Salut chosen later is a new request.
+    for _ in range(30):
+        h.feed_child_slot(rfu.idle_slot())
+    h.feed_child_slot(_packet_slot(0x48))
+    assert len(_queued_packets(h)) == 2 * HostTradeEngine.UR_PACKET_REPEAT
+    # Both sides SetLinkStandbyCallback after the card message [union_room.c:2995].
+    h._words.clear()
+    h.feed_child_slot(rfu.serialize(rfu.exit_standby_words(1)))
+    assert [w[0] for w in h._words] and all(w[0] == rfu.READY_EXIT_STANDBY for w in h._words)
+    assert h.state == H_UROOM_PROMPT
+
+
+def test_battle_and_chat_are_declined_exit_is_silent():
+    h = _engine()
+    h._after_child_block(trade.COUNT_TRAINER_CARD, bytes(100))
+    h.feed_child_slot(_packet_slot(0x41))
+    h.feed_child_slot(_packet_slot(0x45))
+    assert _queued_packets(h) == [0x52] * (2 * HostTradeEngine.UR_PACKET_REPEAT)
+    h._words.clear()
+    h.feed_child_slot(_packet_slot(0x40))
+    assert _queued_packets(h) == []
+
+
+def test_trade_request_is_accepted_with_its_species_and_level():
+    h = _engine()
+    h._after_child_block(trade.COUNT_TRAINER_CARD, bytes(100))
+    h.feed_child_slot(_packet_slot(0x44, 25, 30))
+    assert _queued_packets(h) == [0x51] * HostTradeEngine.UR_PACKET_REPEAT
+    assert h.uroom_requests[-1][:3] == (0x44, 25, 30)
+
+
+def test_packets_are_ignored_outside_the_union_room():
+    h = _engine(union_room=False)
+    h.feed_child_slot(_packet_slot(0x48))
+    assert _queued_packets(h) == []
+
+
+def test_exit_at_the_prompt_answers_the_close_link_handshake():
+    """WaitAllReadyToCloseLink [link_rfu_2.c:1471] needs the parent's READY_CLOSE_LINK."""
+    from pokeldn.frlg.link.host_trade import H_CLOSE
+    h = _engine()
+    h._after_child_block(trade.COUNT_TRAINER_CARD, bytes(100))
+    h.feed_child_slot(_packet_slot(0x40))
+    h._words.clear()
+    h.feed_child_slot(rfu.serialize(rfu.close_link_words(2)))
+    assert h.state == H_CLOSE
+    assert [w[0] for w in h._words] and all(w[0] == rfu.READY_CLOSE_LINK for w in h._words)
+    assert h.close_confirmed
+
+
+def test_close_link_outside_the_room_prompt_is_still_ignored():
+    h = _engine(union_room=False)
+    h.feed_child_slot(rfu.serialize(rfu.close_link_words(2)))
+    assert h.state == H_ENTRY_CARD and not h._words
+
+
+def test_trading_board_request_runs_mon_mail_animation_save_and_close():
+    """Task_StartUnionRoomTrade [union_room.c:1713]: mon and mail blocks, CB2_LinkTrade, then the
+    link closes [trade_scene.c:2722]."""
+    from pokeldn.frlg.link.host_trade import H_ANIM, H_CLOSE, H_SAVE, H_UROOM_TRADE
+    h = HostTradeEngine([_mon(1)], union_room=True, anim_delay=1)
+    h._words.clear()
+    h._begin_card_exchange()
+    h._words.clear(); h._blocks.clear()
+    h._expected = "card"
+    h._after_child_block(trade.COUNT_TRAINER_CARD, bytes(100))
+    h.feed_child_slot(_packet_slot(0x44, 113, 26))
+    assert h.state == H_UROOM_TRADE and h._expected == "uroom_mon"
+    assert h.uroom_trade_request == (113, 26)
+    assert _queued_packets(h) == [0x51] * HostTradeEngine.UR_PACKET_REPEAT
+    h._words.clear()
+    h.feed_child_slot(rfu.serialize(rfu.exit_standby_words(1)))       # START_ACTIVITY_LINK barrier
+    assert all(w[0] == rfu.READY_EXIT_STANDBY for w in h._words)
+    theirs = bytes([7]) + bytes(99)
+    h._after_child_block(trade.COUNT_TRAINER_CARD, theirs)
+    assert h._expected == "uroom_mail"
+    assert [b[1] for b in h._blocks] == ["host:uroom_mon"] and len(h._blocks[0][0]) == 100
+    assert bytes(h.child_party[:100]) == theirs and h.child_cursor == 0
+    h._blocks.clear()
+    h._after_child_block(trade.COUNT_MAIL, bytes(220))
+    assert h.state == H_ANIM and [b[1] for b in h._blocks] == ["host:uroom_mail"]
+    assert len(h._blocks[0][0]) == 220
+    h.feed_child_slot(rfu.serialize(rfu.init_words(trade.COUNT_LINKCMD)))
+    h._on_child_linkcmd(trade.READY_FINISH_TRADE, 0)
+    for _ in range(3):
+        h.tick()
+    assert h.state == H_SAVE and h.received_mons and h.received_mons[0].raw == theirs
+    h._save_final_standby_seen = True
+    for _ in range(h.timing.save_final_standby_quiet_frames + 1):
+        h.feed_child_slot(rfu.idle_slot())
+    assert h.done and h.state == H_SAVE
+    h._words.clear()
+    h.feed_child_slot(rfu.serialize(rfu.close_link_words(5)))
+    assert h.state == H_CLOSE and any(w[0] == rfu.READY_CLOSE_LINK for w in h._words)

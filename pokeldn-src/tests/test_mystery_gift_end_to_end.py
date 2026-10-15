@@ -1,0 +1,481 @@
+#!/usr/bin/env python3
+"""Mystery Gift distributor over an impaired radio: HostReliableSession, RFULeader and the gift
+engine against ConsoleClientModel. Reliable must hide loss from the RFU block gate [link_rfu_2.c:1146].
+
+Run standalone (no pytest needed):   python tests/test_mystery_gift_end_to_end.py
+"""
+
+from collections import defaultdict, deque
+from dataclasses import dataclass
+import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from pokeldn.frlg.gift import host_mystery_gift, mg_link, mg_script, mg_server, stamp_rally, wonder_card, wonder_news  # noqa: E402
+from pokeldn.frlg.link import linkplayer  # noqa: E402
+from pokeldn.gba import gbaframe, ni, rfu  # noqa: E402
+from pokeldn.frlg.link import beacon
+from pokeldn.ldn import reliable  # noqa: E402
+from pokeldn.frlg.gift import mystery_gift as mg  # noqa: E402
+from pokeldn.frlg.link.host_session import HostSession  # noqa: E402
+from pokeldn.gba.rfu_leader import DISCONNECTED  # noqa: E402
+from tests.test_mystery_gift_flow import ConsoleClientModel  # noqa: E402
+
+# ConsoleClientModel's identity: LinkPlayer ASH, trainer id 0x47ED8822 [mystery_gift.c:337].
+CHILD_NAME = "ASH"
+CHILD_TRAINER_ID = 0x8822
+CHILD_VERSION_LOW = 4                       # gGameVersion: 4 = FireRed [include/constants/game_version.h]
+HOST_NAME = "EMU"
+
+
+def _native_crc16(data):
+    """``CalcCRC16WithTable`` transcribed locally, independent of :func:`mystery_gift.crc16`."""
+    crc = 0x1121
+    for byte in bytes(data):
+        crc ^= byte
+        for _ in range(8):
+            crc = (crc >> 1) ^ 0x8408 if crc & 1 else crc >> 1
+    return (~crc) & 0xFFFF
+
+
+def _native_mgl_blocks(ident, payload, size):
+    """``MysteryGiftLink_InitSend``/``MGL_Send`` modelled locally; never replace with
+    ``mg_link.build_message``."""
+    if size == 0:
+        size = 0x400  # MG_LINK_BUFFER_SIZE in mystery_gift_link.c:55-58.
+    payload = bytes(payload)
+    assert 0 < size <= 0x400 and len(payload) <= size
+    buf = payload.ljust(size, b"\x00")
+    header = (int(ident).to_bytes(2, "little")
+              + _native_crc16(buf).to_bytes(2, "little")
+              + size.to_bytes(2, "little"))
+    chunks = [buf[offset:offset + 252] for offset in range(0, size, 252)]
+    return [header] + chunks
+
+
+@dataclass
+class _AirPacket:
+    due: int
+    order: int
+    direction: str
+    wire: bytes
+
+
+class ImpairedRadio:
+    """Drops each ``drop_every``-th DATA sequence's first send, duplicates each
+    ``duplicate_every``-th, reorders by delay; ACKs pass."""
+
+    def __init__(self, *, drop_every=31, duplicate_every=17):
+        self.pending = []
+        self._order = 0
+        self.drop_every = drop_every
+        self.duplicate_every = duplicate_every
+        self.attempts = defaultdict(int)
+        self.dropped = []
+        self.duplicated = []
+        self.reordered = 0
+        self.delivered = 0
+        self.data_frames = defaultdict(int)
+        self.control_frames = defaultdict(int)
+        self.initialized = []
+
+    def _drop_phase(self, direction):
+        return 0 if direction == "host" else 7
+
+    def send(self, direction, emission, now):
+        wire = emission.serialize()
+        frame = reliable.parse_reliable(wire)
+        is_data = bool(frame.flagsA & 0x01)
+        key = (direction, frame.seq)
+        self.attempts[key] += 1
+        attempt = self.attempts[key]
+        if is_data:
+            self.data_frames[direction] += 1
+        else:
+            self.control_frames[direction] += 1
+        if frame.flagsA & 0x08:                 # Initialized: the stream-opening frame
+            self.initialized.append((direction, frame.seq, frame.payload))
+
+        if (is_data and attempt == 1
+                and frame.seq % self.drop_every == self._drop_phase(direction)):
+            self.dropped.append(key)
+            return
+
+        delay = 1 if not is_data or (frame.seq & 1) else 4
+        if is_data and any(p.direction == direction and p.due > now + delay
+                           for p in self.pending):
+            self.reordered += 1             # this frame will overtake one already queued
+        self._enqueue(direction, wire, now + delay)
+        if (is_data and attempt == 1
+                and frame.seq % self.duplicate_every == 0):
+            self.duplicated.append(key)
+            self._enqueue(direction, wire, now + delay + 1)
+
+    def _enqueue(self, direction, wire, due):
+        self._order += 1
+        self.pending.append(_AirPacket(due, self._order, direction, wire))
+
+    def deliver(self, now):
+        ready = [p for p in self.pending if p.due <= now]
+        self.pending = [p for p in self.pending if p.due > now]
+        ready.sort(key=lambda p: (p.due, p.order))
+        self.delivered += len(ready)
+        return ready
+
+
+class ScriptedMysteryGiftConsole:
+    """ConsoleClientModel behind Reliable and RFU: one parent poll in, one row out per VBlank."""
+
+    def __init__(self, console, *, close_rows=4):
+        self.console = console
+        self.rel = reliable.HostReliableSession(ack_period_ms=5,
+                                                rto_bootstrap_ms=20)
+        self.connect_id = b"\x80\x84"
+        self.ni_send = None
+        self.ni_recv = ni.NIReceiver()
+        self.ts = 1
+        self.k_seq = 1
+        self.accept_seen = False
+        self.disconnect_seen = False
+        self.parent_rows = 0
+        self.ni_frames_in = 0
+        self.ni_frames_out = 0
+        self.uni_frames_in = 0
+        self.uni_frames_out = 0
+        self.close_rows_sent = 0
+        self._close_rows = close_rows
+        self._out_rows = deque()
+        self._gba_pending = []
+
+    def start(self, now):
+        """Open the joiner stream with metadata, followed by RFU C."""
+        return [
+            self.rel.open(reliable.METADATA_FRAME, now),
+            self.rel.send(gbaframe.build_connect(self.connect_id), now),
+        ]
+
+    def receive(self, wire, now):
+        for delivery in self.rel.receive(wire, now):
+            rec = gbaframe.parse_in(delivery.payload)
+            if rec is None:
+                continue
+            if rec["type"] == "A":
+                assert rec["connect_id"] == self.connect_id
+                self.accept_seen = True
+                # gRfuGameData.activity = ACTIVITY_WONDER_CARD, so the leader sees
+                # the same activity it advertised [union_room.c SetHostRfuGameData].
+                self.ni_send = ni.NISender(ni.build_game_data(
+                    CHILD_VERSION_LOW, CHILD_TRAINER_ID, CHILD_NAME,
+                    activity=beacon.ACTIVITY_WONDER_CARD))
+            elif rec["type"] == "T":
+                self.k_seq += 1
+                self._queue_gba(gbaframe.build_k(self.k_seq, 1, rec["ts"]), now)
+                if rec.get("ni") is not None:
+                    self.ni_frames_in += 1
+                    ack = self.ni_recv.on_host_ni(rec["ni"])
+                    if ack is not None:
+                        self._queue_gba(gbaframe.wrap_t(ack, self.ts), now)
+                        self.ts += 1
+                elif rec.get("slots"):
+                    self.uni_frames_in += 1
+                    self.parent_rows += 1
+                    # Row 0 of the parent's gRecvCmds echo table is its own
+                    # gSendCmd [ReadAllPlayerRecvCmds, link_rfu_2.c:743].
+                    rows = dict(rec["slots"])
+                    # Row 1 is this console's own last command mirrored back [ChildEcho,
+                    # rfu_leader.py].
+                    self._out_rows.append(
+                        self._console_row(rows[0], rows.get(1)))
+            elif rec["type"] == gbaframe.TYPE_D:
+                self.disconnect_seen = True
+
+    def _console_row(self, parent_row, echo_row=None):
+        row = self.console.step(parent_row, echo_row)
+        if self.console.func == "done" and self.close_rows_sent < self._close_rows:
+            # Rfu_SetCloseLinkCallback [mystery_gift_menu.c:1248]: the console advertises
+            # READY_CLOSE_LINK.
+            self.close_rows_sent += 1
+            row = rfu.serialize(rfu.close_link_words(1))
+        return row
+
+    def _queue_gba(self, frame, now):
+        # advance() owns the radio; receive() only parks immediate replies here.
+        self._gba_pending.append((bytes(frame), now))
+
+    def advance(self, now):
+        if self.disconnect_seen:
+            pass
+        elif self.ni_send is not None and not self.ni_send.done:
+            slot = self.ni_send.next_slot()
+            self.ni_frames_out += 1
+            self._gba_pending.append((gbaframe.wrap_t(slot, self.ts), now))
+            self.ts += 1
+        else:
+            # One UNI reply per parent poll consumed, so a stall then a burst does not rate-limit
+            # the console.
+            while self._out_rows:
+                row = self._out_rows.popleft()
+                self._gba_pending.append(
+                    (gbaframe.wrap_t(rfu.uni_slot(row), self.ts), now))
+                self.ts += 1
+                self.uni_frames_out += 1
+        pending, self._gba_pending = self._gba_pending, []
+        out = [self.rel.send(frame, stamped) for frame, stamped in pending]
+        return out + self.rel.poll(now)
+
+
+class LeaderStack:
+    """The distributor under test, composed exactly as the live host composes it."""
+
+    def __init__(self, engine):
+        self.session = HostSession(
+            engine=engine,
+            reliable_kwargs={"ack_period_ms": 5, "rto_bootstrap_ms": 20},
+            rfu_kwargs={"host_session_id": b"\xb7\xf1"})
+        self.rel = self.session.reliable
+        self.rfu = self.session.rfu
+        self.engine = self.session.activity
+        self.events = []
+
+    def receive(self, wire, now):
+        self.events.extend(self.session.receive_reliable(wire, now))
+
+    def advance(self, now):
+        return self.session.tick(now)
+
+
+@dataclass
+class _Run:
+    host: LeaderStack
+    child: ScriptedMysteryGiftConsole
+    console: ConsoleClientModel
+    engine: host_mystery_gift.HostMysteryGiftEngine
+    radio: ImpairedRadio
+    card: bytes
+    ram_script: bytes
+    elapsed: int
+
+
+def _run_full_stack(*, console=None, timing=None, radio=None, payload=None,
+                    max_ms=6000, require_completion=True):
+    """Drive the whole leader stack against the console model over the radio."""
+    distribution = payload if hasattr(payload, "card") else None
+    card, ram_script = (wonder_card.build_default_gift()
+                        if payload is None else
+                        (payload.card, payload.ram_script)
+                        if distribution is not None else payload)
+    if console is None:
+        console = ConsoleClientModel(flag_id=0)
+    if timing is None:
+        # inter_block_gap_frames keeps its shipped value: it is under test.
+        timing = host_mystery_gift.MysteryGiftTiming(client_ready_idle_frames=10)
+    kwargs = dict(
+        link_player=linkplayer.LinkPlayer(name=HOST_NAME,
+                                          version=linkplayer.VERSION_FIRE_RED),
+        timing=timing)
+    engine = (host_mystery_gift.HostMysteryGiftEngine(
+                  distribution=distribution, **kwargs)
+              if distribution is not None else
+              host_mystery_gift.HostMysteryGiftEngine(card, ram_script, **kwargs))
+    host = LeaderStack(engine)
+    child = ScriptedMysteryGiftConsole(console)
+    radio = radio if radio is not None else ImpairedRadio()
+
+    for emission in child.start(0):
+        radio.send("child", emission, 0)
+
+    for now in range(max_ms):
+        for packet in radio.deliver(now):
+            if packet.direction == "child":
+                host.receive(packet.wire, now)
+            else:
+                child.receive(packet.wire, now)
+
+        for emission in host.advance(now):
+            radio.send("host", emission, now)
+        for emission in child.advance(now):
+            radio.send("child", emission, now)
+
+        if (engine.done and child.disconnect_seen
+                and host.rel.inflight == child.rel.inflight == 0
+                and not radio.pending):
+            return _Run(host, child, console, engine, radio, card, ram_script, now)
+
+    if require_completion:
+        raise AssertionError(
+            f"gift full stack timed out: t={max_ms} engine={engine.state} "
+            f"rfu={host.rfu.state} console={console.func} "
+            f"result={console.result} dropped_inits={console.dropped_inits} "
+            f"pending={len(radio.pending)} "
+            f"inflight={host.rel.inflight}/{child.rel.inflight}")
+    return _Run(host, child, console, engine, radio, card, ram_script, None)
+
+
+_CACHED_RUN = []
+
+
+def _gift_run():
+    """One shared happy-path run; the assertions below inspect it from different angles."""
+    if not _CACHED_RUN:
+        _CACHED_RUN.append(_run_full_stack())
+    return _CACHED_RUN[0]
+
+
+def test_native_shaped_mgl_fixture_covers_the_stage_5_id16_id17_handoff():
+    """ID16 ``sClientScript_SendGameData`` (32 bytes) and ID17 game data (96 bytes) from a
+    source-shaped sender."""
+    card, ram_script = wonder_card.build_default_gift()
+    game_data = ConsoleClientModel(flag_id=0).game_data
+    cases = (
+        (mg.MG_LINKID_CLIENT_SCRIPT, mg_script.CLIENT_SCRIPT_SEND_GAME_DATA,
+         len(mg_script.CLIENT_SCRIPT_SEND_GAME_DATA)),
+        (mg.MG_LINKID_GAME_DATA, game_data, len(game_data)),
+        (mg.MG_LINKID_CLIENT_SCRIPT, mg_script.CLIENT_SCRIPT_SAVE_CARD,
+         len(mg_script.CLIENT_SCRIPT_SAVE_CARD)),
+        (mg.MG_LINKID_CARD, card, len(card)),
+        (mg.MG_LINKID_RAM_SCRIPT, ram_script, 0),
+        (mg.MG_LINKID_READY_END, b"", 0),
+    )
+    assert len(mg_script.CLIENT_SCRIPT_SEND_GAME_DATA) == 32
+    assert len(game_data) == mg_script.GAME_DATA_SIZE == 100
+
+    for ident, payload, size in cases:
+        native = _native_mgl_blocks(ident, payload, size)
+        assert mg_link.build_message(ident, payload, size) == native
+
+        # The production receiver accepts the native-shaped blocks, 1024-byte size-zero messages
+        # included.
+        receiver = mg_link.MysteryGiftLinkReceiver()
+        receiver.expect(ident)
+        padded = [block.ljust(((len(block) + 11) // 12) * 12, b"\x00")
+                  for block in native]
+        result = None
+        for complete_block in padded:
+            result = receiver.feed_block(complete_block)
+        declared_size = 0x400 if size == 0 else size
+        assert result == bytes(payload).ljust(declared_size, b"\x00")
+
+
+def test_wonder_card_reaches_the_console_through_loss_duplication_and_reordering():
+    run = _gift_run()
+
+    assert run.console.result == mg_script.CLI_MSG_CARD_RECEIVED
+    assert run.engine.result == mg_server.SVR_MSG_CARD_SENT and run.engine.gift_sent
+    assert run.console.saved_card == run.card
+    assert run.console.saved_ram_script.startswith(run.ram_script)
+    assert run.console.saved_ram_script[len(run.ram_script):] == b"\x00" * (
+        995 - len(run.ram_script))
+    assert [ident for ident, _payload in run.console.messages_received] == [
+        mg.MG_LINKID_CLIENT_SCRIPT,     # sClientScript_SendGameData
+        mg.MG_LINKID_CLIENT_SCRIPT,     # sClientScript_SaveCard
+        mg.MG_LINKID_CARD,
+        mg.MG_LINKID_RAM_SCRIPT,
+    ]
+
+
+def test_legendary_beast_cutscene_reaches_the_console_over_the_impaired_stack():
+    """The stamp-branch payload survives the complete lossy host path."""
+    payload = wonder_card.build_legendary_beast_cutscene_gift(
+        level=65, flag_id=1005)
+    run = _run_full_stack(payload=payload)
+    assert run.console.result == mg_script.CLI_MSG_CARD_RECEIVED
+    assert run.engine.result == mg_server.SVR_MSG_CARD_SENT
+    assert run.console.saved_card == payload[0]
+    assert run.console.saved_ram_script[:len(payload[1])] == payload[1]
+
+
+def test_wonder_news_reaches_the_console_over_the_impaired_stack():
+    """A 444-byte News and the console's MG_LINKID_RESPONSE survive the impaired radio."""
+    news = wonder_news.BERRY_NEWS.build()
+    distribution = stamp_rally.MysteryGiftDistribution(None, None, news=news)
+    run = _run_full_stack(payload=distribution)
+
+    assert run.console.result == mg_script.CLI_MSG_NEWS_RECEIVED
+    assert run.engine.result == mg_server.SVR_MSG_NEWS_SENT and run.engine.gift_sent
+    assert run.console.saved_news == news
+    assert run.console.saved_card is None and run.console.saved_ram_script is None
+    assert [ident for ident, _payload in run.console.messages_received] == [
+        mg.MG_LINKID_CLIENT_SCRIPT,     # sClientScript_SendGameData
+        mg.MG_LINKID_CLIENT_SCRIPT,     # sClientScript_SaveNews
+        mg.MG_LINKID_NEWS,
+        mg.MG_LINKID_CLIENT_SCRIPT,     # sClientScript_NewsReceived
+    ]
+
+
+def test_the_shared_link_bring_up_completes_below_the_gift():
+    """Everything under the activity is the hardware-proven trade bring-up."""
+    run = _gift_run()
+
+    assert run.host.rel.local_opened and run.host.rel.peer_opened
+    assert run.child.rel.local_opened and run.child.rel.peer_opened
+    assert ("child", 0xFFF0, reliable.METADATA_FRAME) in run.radio.initialized
+    assert any(direction == "host" and seq == 0xFFF0
+               and gbaframe.parse_in(payload)["type"] == "A"
+               for direction, seq, payload in run.radio.initialized)
+    assert "connect" in run.host.events and run.child.accept_seen
+    assert run.host.rfu.child_game_data is not None and run.child.ni_recv.complete
+    assert run.host.rfu.child_trainer_id == CHILD_TRAINER_ID
+    assert run.child.ni_frames_in > 0 and run.child.ni_frames_out > 0
+
+    assert run.engine.child_link_player.name == CHILD_NAME
+    assert run.console.host_link_player.name == HOST_NAME
+    assert run.console.standby_sent and run.console.standby_echoed
+
+
+def test_reliable_hides_every_impairment_from_the_rfu_block_pacing():
+    """SEND_BLOCK_INIT is dropped unless the slot is RECV_STATE_READY [link_rfu_2.c:1146]; nothing
+    acknowledges a block."""
+    run = _gift_run()
+
+    assert [d for d, _seq in run.radio.dropped if d == "host"]
+    assert [d for d, _seq in run.radio.dropped if d == "child"]
+    assert run.radio.duplicated and run.radio.reordered > 0
+    assert all(run.radio.attempts[key] >= 2 for key in run.radio.dropped)
+
+    assert run.console.dropped_inits == 0
+    assert run.console.dropped_fragments == 0
+    # Without native INIT resends [link_rfu_2.c:1370] dropped_inits would be zero for the wrong
+    # reason.
+    assert run.console.redundant_inits > 0
+
+    assert run.child.parent_rows == run.host.rfu.uni_out > 0
+    # The leader leaves UNI on emitting D [RFULeader.disconnect_frame]; the last console rows are
+    # refused.
+    assert 0 < run.host.rfu.uni_in <= run.child.uni_frames_out
+    assert run.engine.server.messages_received == 2      # GAME_DATA, READY_END
+
+
+def test_the_gap_is_still_what_prevents_the_drop_over_the_impaired_radio():
+    """Negative control: no gap and a slow console kill the transfer over the same radio."""
+    starved = ConsoleClientModel(flag_id=0, consume_latency=6)
+    run = _run_full_stack(
+        console=starved, max_ms=2500, require_completion=False,
+        timing=host_mystery_gift.MysteryGiftTiming(
+            client_ready_idle_frames=10, inter_block_gap_frames=0))
+    assert starved.dropped_inits > 0
+    assert run.elapsed is None and starved.result is None
+    assert run.engine.result is None
+
+    slow = ConsoleClientModel(flag_id=0, consume_latency=6)
+    slow_run = _run_full_stack(console=slow)
+    assert slow.dropped_inits == 0
+    assert slow.result == mg_script.CLI_MSG_CARD_RECEIVED
+    assert slow_run.engine.result == mg_server.SVR_MSG_CARD_SENT
+
+
+def test_close_and_disconnect_handshake_finishes_the_session():
+    run = _gift_run()
+
+    assert run.child.close_rows_sent > 0 and run.engine.close_confirmed
+    assert run.host.session.close_poll_sent and run.host.session.disconnect_sent
+    assert run.child.disconnect_seen
+    assert run.engine.state == host_mystery_gift.MG_DONE and run.engine.done
+    assert run.engine.state_history == [
+        host_mystery_gift.MG_LINK_PLAYER, host_mystery_gift.MG_START,
+        host_mystery_gift.MG_GIFT, host_mystery_gift.MG_CLOSE,
+        host_mystery_gift.MG_DONE]
+    assert run.host.rfu.state == DISCONNECTED
+    assert run.host.rel.inflight == run.child.rel.inflight == 0
+    # One parent poll per millisecond is the clean-link floor.
+    assert run.elapsed < run.host.rfu.uni_out * 1.5

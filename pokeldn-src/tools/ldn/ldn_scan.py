@@ -1,0 +1,88 @@
+#!/usr/bin/env python3
+"""Receive-path isolation test: list nearby LDN hosts with the LDN library's own `ldn.scan` (no pokeldn beacon or
+transport code involved). A waiting FRLG trade console is the RFU parent = LDN host, so it shows up here."""
+import argparse
+import os
+import subprocess
+import sys
+
+
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, PROJECT_ROOT)
+BUNDLED_LDN = os.path.join(PROJECT_ROOT, 'vendor', 'LDN')
+if os.path.isdir(BUNDLED_LDN):
+    sys.path.insert(0, BUNDLED_LDN)
+
+import trio
+
+import ldn
+from pokeldn.ldn.transport import board_radio, find_ap_phy, list_phys
+from pokeldn.host_support import resolve_keys
+
+STALE_VIFS = ["ldn", "ldn-mon", "ldn-tap"]
+
+ACCEPT = {ldn.ACCEPT_ALL: "ALL", ldn.ACCEPT_NONE: "NONE",
+          ldn.ACCEPT_BLACKLIST: "BLACKLIST", ldn.ACCEPT_WHITELIST: "WHITELIST"}
+
+
+def _cleanup_stale():
+    if board_radio():
+        return                    # the ESP32 board has no kernel interfaces to remove
+    for name in STALE_VIFS:
+        subprocess.run(["iw", "dev", name, "del"],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--phy", default="auto", help="wifi phy to scan on ('auto' = first AP-capable)")
+    ap.add_argument("--keys", default="~/.switch/prod.keys")
+    ap.add_argument("--channels", default="1,6,11", help="comma-separated channels to dwell on")
+    ap.add_argument("--dwell", type=float, default=1.5, help="seconds per channel")
+    args = ap.parse_args()
+
+    if getattr(os, "geteuid", lambda: 0)() != 0 and not board_radio():
+        ap.error("must run as root (monitor mode needs the raw radio); re-run with sudo -E")
+
+    phy = find_ap_phy(log=print) if args.phy == "auto" else args.phy
+    if phy is None:
+        print(f"[scan] no AP-capable phy found. Present phys: {', '.join(list_phys()) or 'none'}")
+        return 1
+    keys_path = resolve_keys(args.keys)
+    if not os.path.exists(keys_path):
+        print(f"[scan] prod.keys not found at {keys_path!r}"); return 2
+    channels = [int(c) for c in args.channels.split(",") if c.strip()]
+
+    print(f"[scan] phy={phy} keys={keys_path} channels={channels} dwell={args.dwell}s")
+    _cleanup_stale()
+    keys = ldn.load_keys(keys_path)
+
+    async def run():
+        return await ldn.scan(keys, phyname=phy, channels=channels, dwell_time=args.dwell)
+
+    nets = trio.run(run)
+    print(f"\n[scan] found {len(nets)} network(s)")
+    for i, n in enumerate(nets):
+        print(f"\n--- network {i} ---")
+        print(f"  local_communication_id : {n.local_communication_id:016x}")
+        print(f"  ldn protocol           : {getattr(n, 'protocol', '?')}")
+        print(f"  scene_id               : {n.scene_id}")
+        print(f"  version                : {n.version}")
+        print(f"  app_version            : {n.app_version}")
+        print(f"  security_mode          : {n.security_mode}")
+        print(f"  channel                : {n.channel}   band {n.band}")
+        print(f"  accept_policy          : {ACCEPT.get(n.accept_policy, n.accept_policy)}")
+        print(f"  participants           : {n.num_participants}/{n.max_participants}")
+        print(f"  ssid                   : {n.ssid.hex()}")
+        print(f"  host address           : {n.address}")
+        print(f"  application_data       : ({len(n.application_data)} B)")
+        print(f"    {n.application_data.hex()}")
+    if not nets:
+        print("[scan] nothing seen. Is the console on its search screen right now? Try --channels")
+        print("       1..11 or a longer --dwell; with a card, keep NetworkManager off the radio.")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

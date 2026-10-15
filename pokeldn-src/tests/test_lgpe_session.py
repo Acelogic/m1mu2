@@ -1,0 +1,559 @@
+"""Let's Go's session constants, pinned to the binary reading on docs/lgpe_session.md, and the
+version-3 header through pia4."""
+import struct
+import types
+
+import pytest
+
+from pokeldn.ldn import pia4
+from pokeldn.lgpe import (GAME_KEY, PASSPHRASE, PIA_VERSION, packet_iv, scene_id, search_channel,
+                          session_key, session_keys)
+from pokeldn.lgpe.session import APP_HEADER_SIZE
+import lgpe_join
+
+
+def test_constants_are_the_literals_read_off_main():
+    assert PASSPHRASE == b"W3GoSMEn7RIIUQ89rzqBHGhGferRNb7K18ZBq2aNuj8Us9RO9Q9JYyGOZlLy8MYL"
+    assert GAME_KEY == b"p1frXqxmeCZWFv0X"
+    assert PIA_VERSION == 3
+
+
+@pytest.mark.parametrize("code, advertised, channel", [
+    (("pikachu", "pikachu", "pikachu"), 1, 6),          # every retail Pikachu x3 session
+    (("bulbizarre", "salam\u00e8che", "carapuce"), 2341, 6),  # a retail console's advertisement
+    (("2", "3", "2"), 2321, 11),                         # the same console, third pick changed
+    (("evoli", "pikachu", "taupiqueur"), 1091, 11),      # a retail console hosted with it
+])
+def test_the_link_code_is_the_scene_id_and_channel_a_console_advertised(code, advertised, channel):
+    assert scene_id(code) == advertised
+    assert search_channel(code) == channel
+
+
+def test_a_name_outside_the_picker_is_refused():
+    with pytest.raises(ValueError):
+        scene_id(("pikachu", "mewtwo", "pikachu"))
+
+
+def _net(app):
+    return types.SimpleNamespace(application_data=app)
+
+
+def test_session_keys_read_the_5_9_header():
+    app = struct.pack("<IIBBHIQ", 0x11223344, 0xDEADBEEF, 4, APP_HEADER_SIZE, 0, 0x55667788, 0)
+    app += b"\xAA" * 8
+    k = session_keys(_net(app))
+    assert k.network_id_le == bytes.fromhex("44332211")
+    assert k.session_param == 0x55667788
+    assert k.password_crc == 0xDEADBEEF
+    assert k.session_key == session_key(0x55667788)
+    hdr = lgpe_join.app_header(app)
+    assert hdr["system_comm_version"] == 4 and hdr["header_size"] == APP_HEADER_SIZE
+    assert hdr["game_data"] == "aa" * 8
+    with pytest.raises(ValueError):
+        session_keys(_net(b"\0" * 8))
+
+
+def test_version_3_packet_round_trips_through_pia4():
+    app = struct.pack("<IIBBHIQ", 0x01020304, 0, 4, APP_HEADER_SIZE, 0, 0xCAFEBABE, 0)
+    k = session_keys(_net(app))
+    mac = bytes.fromhex("48f1eb0a0b0c")
+    nonce = (7).to_bytes(8, "big")
+    iv = packet_iv(k, mac, nonce, source_id=1)
+    body = pia4.pad_payload(b"\x01\x02\x03\x04")
+    pkt = bytearray(pia4.build_packet(k.session_key, iv, body, station=1, nonce8=nonce))
+    pkt[4] = 0x80 | PIA_VERSION
+    hdr = pia4.PiaHeader4.parse(bytes(pkt))
+    assert hdr.version == 3 and hdr.encrypted and hdr.station == 1
+    pt = pia4.decrypt_payload(k.session_key, iv, pia4.ciphertext(bytes(pkt)), hdr.tag)
+    assert pt == body
+    h, pt2, m, sid = lgpe_join.try_decrypt(k, bytes(pkt), [bytes(6), mac])
+    assert pt2 == body and m == mac and sid == 1
+
+
+def test_pia3_message_framing_is_22_bytes_and_round_trips():
+    from pokeldn.ldn import pia3
+    src = 0xEB9B2220F1480000
+    m = pia3.build_message(b"\x11\x22\x33", protocol=0x14, source=src, port=2, destination=0x2,
+                           message_flags=pia3.MESSAGE_FLAG_BITMAP | pia3.MESSAGE_FLAG_UNBUNDLED)
+    assert len(m) == 28 and m[1] == 1 and m[4] == 0x14 and m[5] == 2
+    assert m[2:4] == b"\x00\x03" and m[6:14] == (2).to_bytes(8, "big")
+    second = pia3.build_message(b"", protocol=0x58, source=src)
+    pkt = pia3.pad_payload(m + second)
+    msgs = pia3.parse_packet(pkt)
+    assert [(x["protocol"], x["port"], x["payload"], x["source"]) for x in msgs] == [
+        (0x14, 2, b"\x11\x22\x33", src), (0x58, 0, b"", src)]
+    assert msgs[0]["flags"] == 0x09 and msgs[1]["at"] == 28
+    app = struct.pack("<IIBBHIQ", 0x01020304, 0, 4, APP_HEADER_SIZE, 0, 0xCAFEBABE, 0)
+    k = session_keys(_net(app))
+    nonce = (9).to_bytes(8, "big")
+    iv = packet_iv(k, bytes(6), nonce, source_id=0)
+    data = pia3.build_packet(k.session_key, iv, pkt, nonce8=nonce)
+    assert pia3.is_pia3(data) and not pia4.is_pia4(data)
+    hdr = pia3.PiaHeader4.parse(data)
+    assert pia3.decrypt_payload(k.session_key, iv, pia3.ciphertext(data), hdr.tag) == pkt
+
+
+def test_station9_connection_request_round_trips():
+    from pokeldn.ldn import station9
+    loc = station9.station_location("169.254.105.2", 12345, 0x1122334455667788, 0x99AABBCC,
+                                    0xDDEEFF00)
+    req = station9.build_connection_request(0xEB9B2220F1480000, 0x0, loc, ack_id=7,
+                                            connection_id=0x2A)
+    assert req[0] == 1 and req[station9.OFF_VERSION] == 9 and req[station9.OFF_IS_INVERSE] == 0
+    got = station9.parse_connection_request(req)
+    assert got["constant_id"] == 0xEB9B2220F1480000 and got["ack_id"] == 7
+    assert got["connection_id"] == 0x2A and got["location"] == loc
+    assert station9.build_ack(7) == bytes.fromhex("0500000000000007")
+    assert station9.ack_id_of(req) == 7
+
+
+def test_station9_connection_response_is_read_where_the_handler_looks():
+    from pokeldn.ldn import station9
+    host_const, host_var = 0xEB9B2220F1480000, 0xC30760A9
+    resp = station9.build_connection_response(host_const, host_var, ack_id=3)
+    assert len(resp) == station9.ACCEPTED_RESPONSE_SIZE + 4
+    assert resp[0] == station9.CONNECTION_RESPONSE and resp[1] == 0
+    assert resp[station9.OFF_RESPONSE_CONSTANT_ID:station9.OFF_RESPONSE_CONSTANT_ID + 8] == \
+        host_const.to_bytes(8, "big")
+    assert resp[station9.OFF_RESPONSE_VARIABLE_ID:station9.OFF_RESPONSE_VARIABLE_ID + 4] == \
+        host_var.to_bytes(4, "big")
+    assert resp[station9.OFF_RESPONSE_GATE] == 1 and resp[-4:] == (3).to_bytes(4, "big")
+
+
+def test_clone_clock_reply_matches_the_serializer():
+    from pokeldn.ldn import clone
+    req = bytes.fromhex("0311c2350000000100020000000000003647")
+    r = clone.parse_clock_request(req)
+    assert r["type"] == clone.CLOCK_REQUEST and r["field_a"] == 0xC235 and r["count"] == 1
+    assert r["participant"] == 2 and r["clock"] == 0x3647
+    rep = clone.reply_to(req)
+    assert len(rep) == 22 and rep[0] == 3 and rep[1] == clone.CLOCK_REPLY
+    assert rep[2:4] == b"\xc2\x35" and rep[4:8] == (1).to_bytes(4, "big")
+    assert rep[8:10] == (2).to_bytes(2, "big") and rep[0xA:0xE] == b"\x00\x00\x00\x00"
+    assert rep[0xE:0x16] == (0x3647).to_bytes(8, "big")
+    assert clone.parse_clock_request(b"\x03\x21" + b"\x00" * 16) is None
+
+
+def test_clone_participate_is_ten_bytes():
+    from pokeldn.ldn import clone
+    p = clone.build_participate(field_a=0xC235, value=1, participant=2)
+    assert len(p) == 10 and p[0] == 3 and p[1] == clone.PARTICIPATE
+    assert p[2:4] == b"\xc2\x35" and p[4:8] == (1).to_bytes(4, "big")
+    assert p[8:10] == (2).to_bytes(2, "big")
+
+
+def test_clone_participant_reproduces_the_two_endpoint_exchange():
+    """The measured exchange (docs/lgpe_session.md, The Clone Protocol): ten answered requests, then
+    participate; a peer's participate is acked with 0x33."""
+    from pokeldn.ldn import clone
+    p = clone.Participant(100.0, dest=0x0001)
+    # the host's first request, as captured
+    req = bytes.fromhex("0311161b0000000100020000000000013483")
+    rep, = p.receive(req, 100.275)
+    r = clone.parse_clock_reply(rep)
+    assert rep[1] == clone.CLOCK_REPLY and r["count"] == 1 and r["participant"] == 0x0001
+    assert r["ms"] == 275 and r["clock"] == 0x13483
+    out = p.poll(100.3)
+    assert len(out) == 1 and out[0][1] == clone.CLOCK_REQUEST and len(out[0]) == 18
+    assert clone.parse_clock_request(out[0])["count"] == 2
+    assert p.poll(100.31) == []
+    for i in range(10):
+        p.poll(101 + i)
+        assert p.receive(clone.build_clock_reply(0, 0, 1, 0, kind=clone.CLOCK_REPLY), 101 + i) == []
+    out = p.poll(111.0)
+    assert out[-1][1] == clone.PARTICIPATE and out[-1][8:10] == b"\x00\x03"
+    assert clone.parse_clock_request(out[0])["count"] + 1 == int.from_bytes(out[-1][4:8], "big")
+    rep, = p.receive(req, 112.0)
+    assert rep[1] == clone.CLOCK_REPLY_SYNCED
+    ack, = p.receive(bytes.fromhex("033116dd000000240003"), 112.1)
+    assert ack[1] == clone.PARTICIPATE_ACK and ack[8:10] == b"\x00\x01" and len(ack) == 10
+    a, b = clone.Participant(0.0, dest=0x0002), clone.Participant(0.0, dest=0x0001)
+    t = 0.0
+    while t < 5 and not (a.participated and b.participated):
+        for src, dst in ((a, b), (b, a)):
+            for m in src.poll(t):
+                for back in dst.receive(m, t):
+                    src.receive(back, t)
+        t += 0.05
+    assert a.participated and b.participated
+
+
+def test_sync_clock_matches_the_wiki_layout():
+    """Bytes from the two-endpoint capture: the reply copies the tick and adds the mesh clock in ms."""
+    from pokeldn.ldn import sync_clock
+    req = bytes.fromhex("00000000412702000000000000000000")
+    rep = bytes.fromhex("00000000412702000000000000001864")
+    assert sync_clock.parse_message(req) == (0x41270200, 0)
+    assert sync_clock.parse_message(rep) == (0x41270200, 0x1864)
+    assert sync_clock.build_request(0x41270200) == req
+    s = sync_clock.SyncClock(100.0)
+    out, = s.poll(100.0)
+    assert len(out) == 16 and out[8:] == b"\0" * 8 and s.poll(100.5) == []
+    tick = sync_clock.parse_message(out)[0]
+    assert tick == int(100.0 * sync_clock.TICK_HZ)
+    assert s.receive(struct.pack(">QQ", tick, 6244), 100.040) == []
+    assert s.clock_ms == 6244 + 20            # half the 40 ms round trip
+    assert s.now_ms(101.040) == s.clock_ms + 1000
+    assert s.poll(102.0) and s.replies == 1
+
+
+def test_clone_data_messages_match_the_captured_bytes():
+    """Against the two-endpoint capture; the game's deflate is one compress, a sync flush and a
+    final block."""
+    from pokeldn.ldn import clone
+    state = ("03f316e303fd0000000000000003"
+             "785e5210636060666000133cff18a000000000ffff03000e670147")
+    d = clone.parse_data_message(bytes.fromhex(state))
+    assert d["type"] == clone.STATE_DATA and d["ctype"] == 3 and d["station"] == 0xFD
+    assert d["clone_id"] == 0 and d["flags"] == b"\x00\x03"
+    r = d["record"]
+    assert r["kind"] == clone.RECORD_STATE and r["station"] == 0 and r["participants"] == 3
+    assert r["clock"] == 0x0CFE and r["data"] == b"\0" * 8
+    assert clone.build_data_message(clone.STATE_DATA, 3, 0xFD, 0, 0x16E3,
+                                    clone.build_state_record(0, 0, 3, 0x0CFE, b"\0" * 8),
+                                    flags=3).hex() == state
+    # the joiner's own acknowledgement of that message, as captured
+    ack = ("03e300e203fd00000000000000"
+           "785e52e0626060656060e0f907000000ffff030002d8013a")
+    p = clone.Participant(0.0, dest=0x0001)
+    out, = p.receive(bytes.fromhex(state), 1.0)
+    assert out.hex()[8:] == ack[8:]                 # everything but the frame counter
+    a = clone.parse_data_message(out)["record"]
+    assert a["kind"] == clone.RECORD_ACK and a["clock"] == 0x0CFE and a["station"] == 0
+    assert clone.parse_data_message(bytes.fromhex(ack))["record"]["clone_id"] == 0
+
+
+def test_clone_exit_request_is_acknowledged():
+    """An exit request (0x32) draws the 14-byte exit ack carrying our station bitmap."""
+    from pokeldn.ldn import clone
+    p = clone.Participant(0.0, dest=0x0001, own=0x0002)
+    out, = p.receive(bytes.fromhex("0332b7f0000000330003"), 1.0)
+    assert len(out) == 14 and out[1] == clone.EXIT_ACK and p.exited
+    assert out[8:10] == b"\x00\x01" and out[10:14] == (2).to_bytes(4, "big")
+
+
+def test_full_connection_response_matches_a_real_station():
+    """With a network id the response is the capture's 0x348-byte body."""
+    from pokeldn.ldn import station9
+    r = station9.build_connection_response(0x7F00020000020000, 0x5E8E66C4, ack_id=0x4110DDD9,
+                                           network_id=0x64CB9EF7, player_name=b"RyuPlayer")
+    assert len(r) == 0x348
+    assert r[:0x11].hex() == "02000904007f000200000200005e8e66c4"
+    assert r[0x31:0x40] == bytes.fromhex("64cb9ef7010101") + b"username"
+    assert r[0x88:0x92] == b"\x01RyuPlayer" and r[0xB1] == 1
+    assert r[0x344:] == (0x4110DDD9).to_bytes(4, "big")
+    assert set(r[0x11:0x31]) == {0} and set(r[0xB2:0x344]) == {0}
+    short = station9.build_connection_response(1, 2)
+    assert len(short) == station9.ACCEPTED_RESPONSE_SIZE + 4
+
+
+def test_rtt_version_3_carries_the_kind_as_a_u32():
+    """Sixteen bytes with the kind as a big-endian u32, from both directions of the capture."""
+    from pokeldn.ldn import rtt_protocol as rtt
+    req = bytes.fromhex("00000000000000000000000049845557")
+    assert rtt.parse_v3(req)["kind"] == rtt.REQUEST
+    assert rtt.parse_v3(req)["timestamp"] == 0x49845557
+    assert rtt.response_for_v3(req).hex() == "00000001000000000000000049845557"
+    assert rtt.build_v3(rtt.REQUEST, 0x41270099).hex() == \
+        "00000000000000000000000041270099"
+    assert rtt.response_for_v3(rtt.response_for_v3(req)) is None
+
+
+def test_local_wireless_station_location_matches_a_real_joiner():
+    """36 bytes, the capture's joiner's: an empty public address and no NAT fields."""
+    from pokeldn.ldn import station4
+    from pokeldn.ldn.station_protocol import station_location
+    loc = station_location("127.0.0.3", 12345, 0x7F00030000020000, 0x08386213, 0x565FE1D8,
+                           nat_flags=0, nat_location=0, public=False)
+    assert loc.hex() == ("020600007f00000330390000000000007f0003000002000008386213"
+                         "565fe1d800000001")
+    p = station4.parse_station_location(loc)
+    assert p["size"] == 36 and p["ip"] == "127.0.0.3" and p["port"] == 12345
+    assert p["variable_id"] == 0x08386213 and p["nat_flags"] == 0
+    assert len(station_location("127.0.0.3", 12345, 1, 2, 3)) == 40
+
+
+def test_clone_announcement_is_mirrored_the_way_a_real_joiner_does():
+    """A joiner takes over three clone types and announces its own copy, as a real joiner does."""
+    from pokeldn.ldn import clone
+    p = clone.Participant(0.0, dest=0x0001, own=0x0002, station=1)
+    p.participated = p.peer_participated_ack = p.announced = True
+    p.mesh_ms = 0xA39F
+    for ctype in (4, 1):
+        assert p.receive(clone.build_command(0xA1, ctype, 0xFD, 1, 5, 2,
+                                             bytes.fromhex("0000a39f0138743b")), 1.0) == []
+    assert p.receive(clone.build_command(clone.COMMAND_ANNOUNCE, 2, 0x00, 1, 6, 2), 1.0) == []
+    # All seven go out in one frame, as in a session that works.
+    out = [m for m in p.poll(1.0) if m[1] >= 0x80]
+    kinds = [(m[1], clone.parse_command(m)["ctype"], clone.parse_command(m)["station"]) for m in out]
+    # The reference joiner's burst carries no acknowledgement; it acks 72 ms later, replying to the
+    # peer's own.
+    assert kinds == [(clone.COMMAND_REQUEST, 1, 0xFD), (clone.CLOCK_COMMAND, 4, 0xFD),
+                     (clone.CLOCK_COMMAND, 2, 1), (clone.COMMAND_END_ACK, 4, 0xFD),
+                     (clone.COMMAND_ANNOUNCE, 2, 1), (clone.CLOCK_AND_COUNT, 4, 0xFD),
+                     (clone.CLOCK_AND_COUNT, 1, 0xFD)]
+    # The take-over carries the host's clock: the sequence it allocated for the clone.
+    assert clone.parse_command(out[1])["payload"] == bytes.fromhex("0000a39f")
+    assert clone.parse_command(out[2])["payload"] == bytes.fromhex("0000a39f")
+    # Our own copy keeps our own clock, with the host's content behind it.
+    assert clone.parse_command(out[5])["payload"].hex() == "0000a39f0138743b"
+    assert p.receive(clone.build_command(clone.COMMAND_ANNOUNCE, 2, 0x00, 1, 7, 2), 1.1) == []
+
+
+def test_mirrored_announcement_takes_the_content_that_arrives_after_it():
+    """The content is resolved when our copy is sent, not when it is queued."""
+    from pokeldn.ldn import clone
+    p = clone.Participant(0.0, dest=0x0001, own=0x0002, station=1)
+    p.participated = p.peer_participated_ack = p.announced = True
+    p.mesh_ms = 0x38565
+    p.receive(clone.build_command(clone.COMMAND_ANNOUNCE, 2, 0x00, 1, 6, 2), 1.0)
+    for ctype in (4, 1):
+        p.receive(clone.build_command(0xA1, ctype, 0xFD, 1, 7, 2,
+                                      bytes.fromhex("000385650138743b")), 1.0)
+    later = [m for m in p.poll(1.05) if m[1] == clone.CLOCK_AND_COUNT]
+    assert len(later) == 2
+    for m in later:
+        assert clone.parse_command(m)["payload"].hex() == "000385650138743b"
+
+
+def test_reliable_window_matches_the_captured_exchange():
+    """Pia 5.11's reliable header: 24 bytes, 32-bit ids from 0xFFFFF82F; an ack is the header alone."""
+    from pokeldn.ldn import reliable3
+    w = reliable3.Window()
+    m = w.send(b"\x01\x02\x03")
+    assert m[:24].hex() == "000300030000000" + "0fffff82ffffff82f" + "0000000000000000"
+    assert reliable3.parse(m)["payload"] == b"\x01\x02\x03"
+    assert w.sequence == reliable3.FIRST_SEQUENCE + 1
+    host = reliable3.build(b"\xaa" * 4, reliable3.FIRST_SEQUENCE, reliable3.FIRST_SEQUENCE + 1)
+    ack, = w.receive(host)
+    assert ack.hex() == "000000000000000000000000fffff8300000000000000000"
+    assert w.received == [b"\xaa" * 4] and w.receive(ack) == []
+
+
+def test_host_mesh_and_session_messages_rebuild_a_console_s_own():
+    """Join response, update mesh and update session rebuild the bytes a retail Let's Go Pikachu sent."""
+    from pokeldn.ldn import local_protocol as lp, mesh_protocol as mp
+    from pokeldn.lgpe import local_host, mesh_host
+    from pokeldn.lgpe import build_advertise_data, parse_advertise_data
+    assert build_advertise_data(0x3BB06B64, 0x0865493D).hex() == \
+        "646bb03b00000000041800003d4965080000000000000000"
+    assert parse_advertise_data(build_advertise_data(1, 2)) == \
+        {"network_id": 1, "password_crc": 0, "system_comm_version": 4, "header_size": 24,
+         "session_param": 2}
+    host_loc = bytes.fromhex("020600007f00000330390000000000007f0003000002000008386213"
+                             "565fe1d800000001")
+    entries = [(host_loc, 2), (host_loc, 0)]
+    jr = mesh_host.build_join_response(entries[:1], 0x1E26CEDF)
+    assert len(jr) == mp.JOIN_RESPONSE_TWO_STATIONS_V4 - mp.STATION_INFO_SIZE_V4
+    p = mp.parse_join_response(jr, version4=True)
+    assert p["host_index"] == 0 and p["our_index"] == 1 and p["max_total"] == 8
+    assert p["ack_id"] == 0x1E26CEDF and p["station_info"][0]["station_index"] == 2
+    um = mesh_host.build_update_mesh(entries, 1)
+    assert len(um) == mp.UPDATE_MESH_SIZE_V4
+    assert mp.parse_update_mesh(um, version4=True)["update_counter"] == 1
+    us = local_host.build_update_session(2, 0xE3DEF9C2, 0xCF897AE9, 0x597BC2A3,
+                                         bytes.fromhex("000048f120229beb"),
+                                         [("169.254.19.1", 12345, 0),
+                                          ("169.254.19.2", 12345, 1)])
+    assert len(us) == 121
+    back = lp.parse_update_session(us)
+    assert back.sequence_id == 2 and back.host_variable_id == 0xCF897AE9
+    assert [n.ip for n in back.occupied] == ["169.254.19.1", "169.254.19.2"]
+
+
+def test_the_host_answers_a_connection_request_and_a_join_request():
+    """bin/lgpe_host.py offline: a connection request and a join request each draw the expected replies."""
+    import importlib.util
+    import pathlib
+    root = pathlib.Path(__file__).resolve().parent.parent
+    spec = importlib.util.spec_from_file_location("lgpe_host", root / "bin" / "lgpe_host.py")
+    lgpe_host = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(lgpe_host)
+    from pokeldn.ldn import mesh_protocol as mp, pia3, pia4, station9
+    from pokeldn.lgpe import packet_iv
+
+    class FakeHost:
+        our_ip, our_mac = "169.254.19.1", bytes.fromhex("48f1eb209b22")
+        ssid = b"\1" + bytes(15)
+
+        def __init__(self):
+            self.participants = [(1, "169.254.19.2", bytes.fromhex("48f1eb209b23"), b"C\0")]
+            self.sent = []
+
+        def send(self, datagram, dst_ip):
+            self.sent.append(datagram)
+
+        def recv(self):
+            return []
+
+    adv = lgpe_host.Advertisement(0x11223344, 0x55667788)
+    args = lgpe_host.build_parser().parse_args([])
+    host = FakeHost()
+    s = lgpe_host.Session(host, adv, args, lambda **kw: None)
+    s.poll()
+    assert s.peer_ip == "169.254.19.2"
+    loc = station9.station_location("169.254.19.2", 12345, station9.ldn_constant_id(s.peer_mac),
+                                    0x0B0B0B0B, station9.ldn_service_variable_id(s.peer_mac),
+                                    nat_flags=0, nat_location=0, public=False)
+    s.handle(station9.PROTOCOL, station9.build_connection_request(s.our_const, 0, loc, ack_id=7))
+    s.handle(mp.PROTOCOL, mp.build_join_request(9))
+    out = []
+    for pkt in host.sent:
+        hdr = pia4.PiaHeader4.parse(pkt)
+        pt = pia4.decrypt_payload(adv.keys.session_key,
+                                  packet_iv(adv.keys, host.our_mac, hdr.nonce8, source_id=0),
+                                  pia4.ciphertext(pkt), hdr.tag)
+        assert pt is not None
+        out += [(m["protocol"], m["payload"][0], m["size"]) for m in pia3.parse_packet(pt)]
+    assert (station9.PROTOCOL, station9.CONNECTION_REQUEST, 57) in out
+    assert (station9.PROTOCOL, station9.CONNECTION_RESPONSE, 0x348) in out
+    assert (mp.PROTOCOL, mp.JOIN_RESPONSE, 148) in out
+    assert (mp.PROTOCOL, mp.UPDATE_MESH, 524) in out
+    assert s.peer_variable_id == 0x0B0B0B0B and s.joined
+
+
+def test_a_new_sequence_gets_a_fresh_take_over():
+    """`takeover_per_sequence` (off by default): a second take-over cancels the announcement (0x520d30)."""
+    from pokeldn.ldn import clone
+    p = clone.Participant(0.0, dest=0x0001, own=0x0002, station=1)
+    p.takeover_per_sequence = True
+    p.participated = p.peer_participated_ack = p.announced = True
+    p.mesh_ms = 0x1418F
+
+    def announce(t, seq):
+        for ctype in (4, 1):
+            p.receive(clone.build_command(0xA1, ctype, 0xFD, 1, 5, 2,
+                                          bytes.fromhex(seq + "015cce0c")), t)
+
+    def takeover_clocks(t):
+        return [clone.parse_command(m)["payload"][:4].hex()
+                for m in p.poll(t) if m[1] == clone.CLOCK_COMMAND]
+
+    announce(1.0, "0001418f")
+    p.receive(clone.build_command(clone.COMMAND_ANNOUNCE, 2, 0x00, 1, 6, 2), 1.0)
+    assert takeover_clocks(1.0) == ["0001418f", "0001418f"]
+
+    announce(1.012, "000141c7")
+    assert takeover_clocks(1.012) == ["000141c7", "000141c7"]
+
+    # Quiet while the peer retransmits the same one, about ten times a second.
+    announce(1.2, "000141c7")
+    assert takeover_clocks(1.2) == []
+
+
+def test_a_retransmitted_publish_is_answered_once_with_a_copy_then_acknowledged():
+    """A retransmitted publish gets one copy of ours, then acknowledgements."""
+    from pokeldn.ldn import clone
+    p = clone.Participant(0.0, dest=0x0001, own=0x0002, station=1)
+    p.participated = p.peer_participated_ack = p.announced = True
+    p.publish_once = True
+    p.mesh_ms = 0x1000
+    record = clone.build_state_record(1, 0, 3, 0x1000, bytes(20))
+    publish = clone.build_data_message(clone.STATE_DATA, 2, 0x00, 1, 1, record, flags=3)
+    answers = [[m[1] for m in p.receive(publish, 1.0 + i * 0.1)] for i in range(5)]
+    assert answers == [[clone.STATE_DATA]] + [[clone.STATE_ACK]] * 4
+
+    changed = clone.build_data_message(
+        clone.STATE_DATA, 2, 0x00, 1, 2,
+        clone.build_state_record(1, 0, 3, 0x2000, bytes(19) + b"\x01"), flags=3)
+    assert [m[1] for m in p.receive(changed, 2.0)] == [clone.STATE_DATA]
+
+
+def test_a_re_announcement_is_answered_with_the_take_over_alone():
+    """The 0x82 makes a peer allocate the next sequence; a re-announcement gets only the two clock
+    commands."""
+    from pokeldn.ldn import clone
+    p = clone.Participant(0.0, dest=0x0001, own=0x0002, station=1)
+    p.takeover_per_sequence = True
+    p.participated = p.peer_participated_ack = p.announced = True
+    p.mesh_ms = 0x1418F
+
+    def announce(t, seq):
+        for ctype in (4, 1):
+            p.receive(clone.build_command(0xA1, ctype, 0xFD, 1, 5, 2,
+                                          bytes.fromhex(seq + "015cce0c")), t)
+
+    announce(1.0, "0001418f")
+    p.receive(clone.build_command(clone.COMMAND_ANNOUNCE, 2, 0x00, 1, 6, 2), 1.0)
+    assert [m[1] for m in p.poll(1.0) if m[1] >= 0x80] == [
+        clone.COMMAND_REQUEST, clone.CLOCK_COMMAND, clone.CLOCK_COMMAND, clone.COMMAND_END_ACK,
+        clone.COMMAND_ANNOUNCE, clone.CLOCK_AND_COUNT, clone.CLOCK_AND_COUNT]
+
+    announce(1.03, "000141c7")
+    again = [m for m in p.poll(1.03) if m[1] >= 0x80]
+    # The peer's own 0xa2 arrives in the same frame; the reply to it carries the sequence the
+    # completion matches.
+    assert [m[1] for m in again] == [clone.CLOCK_COMMAND, clone.CLOCK_COMMAND]
+    assert all(clone.parse_command(m)["payload"][:4] == bytes.fromhex("000141c7") for m in again)
+
+
+def test_a_single_take_over_leaves_the_peer_re_announcing():
+    """0x91 on clone type 2 is a NAK: 0x520d30 unlinks as 0x520ce0 does, without writing +0x110."""
+    from pokeldn.ldn import clone
+    p = clone.Participant(0.0, dest=0x0001, own=0x0002, station=1)
+    p.takeover_per_sequence = False
+    p.participated = p.peer_participated_ack = p.announced = True
+    p.mesh_ms = 0x1418F
+
+    def announce(t, seq):
+        for ctype in (4, 1):
+            p.receive(clone.build_command(0xA1, ctype, 0xFD, 1, 5, 2,
+                                          bytes.fromhex(seq + "015cce0c")), t)
+
+    announce(1.0, "0001418f")
+    p.receive(clone.build_command(clone.COMMAND_ANNOUNCE, 2, 0x00, 1, 6, 2), 1.0)
+    assert [m[1] for m in p.poll(1.0)].count(clone.CLOCK_COMMAND) == 2
+
+    # Off: 1792 retransmits over one 180 s run, against three when each is taken over.
+    announce(1.03, "000141c7")
+    assert [m for m in p.poll(1.03) if m[1] == clone.CLOCK_COMMAND] == []
+    announce(1.2, "00014210")
+    assert [m for m in p.poll(1.2) if m[1] == clone.CLOCK_COMMAND] == []
+
+
+def test_a_re_announcement_is_acknowledged_rather_than_taken_over_again():
+    """`ack_re_announcement` answers a re-announcement with one 0xa2 carrying its clock, as the
+    reference joiner does."""
+    from pokeldn.ldn import clone
+    p = clone.Participant(0.0, dest=0x0001, own=0x0002, station=1)
+    p.takeover_per_sequence = True
+    p.ack_re_announcement = True
+    p.participated = p.peer_participated_ack = p.announced = True
+    p.mesh_ms = 0x1418F
+
+    def announce(t, seq):
+        out = []
+        for ctype in (4, 1):
+            out += p.receive(clone.build_command(0xA1, ctype, 0xFD, 1, 5, 2,
+                                                 bytes.fromhex(seq + "015cce0c")), t)
+        return out
+
+    announce(1.0, "0001418f")
+    p.receive(clone.build_command(clone.COMMAND_ANNOUNCE, 2, 0x00, 1, 6, 2), 1.0)
+    assert [clone.parse_command(m)["payload"][:4].hex()
+            for m in p.poll(1.0) if m[1] == clone.CLOCK_COMMAND] == ["0001418f", "0001418f"]
+
+    out = announce(1.012, "000141c7") + p.poll(1.012)
+    assert [clone.parse_command(m)["payload"][:4].hex()
+            for m in out if m[1] == clone.CLOCK_COMMAND] == []
+    acks = [clone.parse_command(m) for m in out if m[1] == clone.CLOCK_AND_COUNT_2]
+    assert [a["payload"].hex() for a in acks] == ["000141c700000002"]
+    assert [(a["ctype"], a["station"]) for a in acks] == [(2, 1)]
+
+
+def test_the_peers_acknowledgement_is_not_answered_with_one_of_our_own():
+    """The peer's 0xa2 is not acknowledged; the reference joiner sends one 0xa2 per clone."""
+    from pokeldn.ldn import clone
+    p = clone.Participant(0.0, dest=0x0001, own=0x0002, station=1)
+    p.ack_peer_clock = p.ack_re_announcement = True
+    p.participated = p.peer_participated_ack = p.announced = True
+    p.mesh_ms = 0x1000
+    p.announce_clocks[1] = bytes.fromhex("00018435")
+
+    out = p.receive(clone.build_command(0xA2, 2, 0x00, 1, 9, 2,
+                                        bytes.fromhex("0001847f01000002")), 1.0)
+    assert [m for m in out if m[1] == clone.CLOCK_AND_COUNT_2] == []
+
+    # Our own copy's announcement follows 35 ms later, as the reference does.
+    assert [clone.parse_command(m)["clone_id"]
+            for m in p.poll(1.036) if m[1] == clone.COMMAND_ANNOUNCE] == [1]

@@ -1,0 +1,102 @@
+#!/usr/bin/env python3
+"""The Altering Cave event, ported from `MysteryEventScript_AlteringCave`
+[decomp:data/mystery_event_msg.s:325]."""
+
+import os
+import sys
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, ROOT)
+sys.path.insert(0, os.path.join(ROOT, "tests"))
+
+import frlg_mg_host  # noqa: E402
+from pokeldn.frlg.gift import gift_registry, gift_to_bin, mystery_gift, wonder_card, wonder_card_events as event  # noqa: E402
+from pokeldn.frlg.rom import buffer_script  # noqa: E402
+from pokeldn.frlg.save import save_inject  # noqa: E402
+from pokeldn.frlg.text import charmap  # noqa: E402
+from pokeldn.frlg.gift.gift_composer import VAR_MYSTERY_GIFT_1, compile_definition  # noqa: E402
+from test_gift_composer import ScriptVM  # noqa: E402
+
+
+def _distribution():
+    return compile_definition(event.ALTERING_CAVE_GIFT)
+
+
+def _talk(script, variables):
+    """One conversation with the delivery man, from a given save state."""
+    vm = ScriptVM(script, variables=dict(variables))
+    vm.run()
+    return vm
+
+
+def test_the_card_is_registered_and_reaches_every_launcher():
+    distribution = _distribution()
+    card = distribution.card
+
+    assert len(card) == wonder_card.WONDER_CARD_SIZE
+    assert int.from_bytes(card[0:2], "little") == event.ALTERING_CAVE_FLAG_ID == 1004
+    assert int.from_bytes(card[2:4], "little") == event.SPECIES_ZUBAT
+    assert card[8] & 0x3 == mystery_gift.CARD_TYPE_GIFT
+    assert charmap.decode(card[50:90]) == "Rumors from ALTERING CAVE"
+
+    slug = event.GIFT_ALTERING_CAVE
+    assert slug in gift_registry.GIFT_REGISTRY.live_choices
+    assert slug in gift_registry.GIFT_REGISTRY.static_choices
+    assert slug in frlg_mg_host.build_parser()._option_string_actions["--gift"].choices
+    assert slug in gift_to_bin.build_parser()._option_string_actions["--gift"].choices
+    assert slug in save_inject.build_parser()._option_string_actions["--gift"].choices
+
+
+def test_the_var_walks_the_whole_cycle_and_wraps_where_the_official_script_wraps():
+    """The official script resets at 10, not 9 [decomp:data/mystery_event_msg.s:328]; id 9 reads as
+    table 0 [src/wild_encounter.c:193]."""
+    script = _distribution().ram_script
+    state = {event.VAR_ALTERING_CAVE_WILD_SET: 0, VAR_MYSTERY_GIFT_1: 0}
+    seen = []
+    for _ in range(12):
+        vm = _talk(script, state)
+        state = dict(vm.vars)
+        seen.append(state[event.VAR_ALTERING_CAVE_WILD_SET])
+
+    assert seen == [1, 2, 3, 4, 5, 6, 7, 8, 9, 0, 1, 2]
+    assert event.ALTERING_CAVE_WRAP == 10
+    assert event.NUM_ALTERING_CAVE_TABLES == 9
+
+
+def test_the_binding_survives_so_the_cave_can_be_rotated_more_than_once():
+    """`end`, never `endram`: ScrCmd_endram calls ClearRamScript [decomp:src/scrcmd.c:262]."""
+    script = _distribution().ram_script
+    # The code runs up to the first message the script points at; the text pool follows it.
+    code = script[:min(int.from_bytes(script[pos + 1:pos + 5], "little") - 0x08000000
+                       for pos in range(len(script) - 4) if script[pos] == 0xBD)]
+
+    assert code.endswith(bytes([0x6C, 0x02]))          # release, end
+    assert 0x0D not in code                            # never endram
+
+    vm = _talk(script, {event.VAR_ALTERING_CAVE_WILD_SET: 4, VAR_MYSTERY_GIFT_1: 0})
+    assert vm.vars[VAR_MYSTERY_GIFT_1] == 0, "the cursor is reset, so the next talk replays it"
+    assert vm.vars[event.VAR_ALTERING_CAVE_WILD_SET] == 5
+
+
+def test_nothing_but_the_cave_var_and_the_card_bookkeeping_is_touched():
+    """A card the player keeps must not move anything else in their save."""
+    script = _distribution().ram_script
+    before = {event.VAR_ALTERING_CAVE_WILD_SET: 3, VAR_MYSTERY_GIFT_1: 0}
+    vm = _talk(script, before)
+
+    touched = {name for name, value in vm.vars.items() if before.get(name) != value}
+    assert touched == {event.VAR_ALTERING_CAVE_WILD_SET}
+    assert vm.items == [] and vm.mons == [] and vm.battles == [] and vm.sprites == []
+    assert vm.flags == {wonder_card.flag_for_flag_id(event.ALTERING_CAVE_FLAG_ID)}
+
+
+def test_the_run_is_checked_by_reading_the_var_out_of_the_save():
+    """The var is in SaveBlock1.vars [decomp:include/global.h:791], readable by save-dump."""
+    assert buffer_script.sav1_var_offset(event.VAR_ALTERING_CAVE_WILD_SET) == 0x1048
+    assert buffer_script.sav1_var_offset(0x4000) == buffer_script.SAV1_VARS
+    for bad in (0x3FFF, 0x4100, 0x8000):
+        try:
+            buffer_script.sav1_var_offset(bad)
+        except ValueError:
+            continue
+        raise AssertionError(f"0x{bad:04X} was accepted as a saved var")

@@ -1,0 +1,57 @@
+#!/usr/bin/env bash
+# Collect a shareable debug report for the LDN hosting failure (ENOTSUP at create_ap), with no
+# pokeldn code involved. Legacy Linux path.
+#
+#   sudo ./ldn_debug_report.sh [phy]        (default phy0; writes ldn-debug-report.txt)
+set -u
+
+PHY="${1:-phy0}"
+OUT="ldn-debug-report.txt"
+if [ "$(id -u)" -ne 0 ]; then
+    echo "Run with sudo (vif-creation experiments need root): sudo $0 $PHY" >&2
+    exit 1
+fi
+
+exec > >(tee "$OUT") 2>&1
+
+section() { echo; echo "========== $1 =========="; }
+
+section "date / kernel / distro"
+date -Is
+uname -a
+. /etc/os-release 2>/dev/null && echo "distro: ${PRETTY_NAME:-?}"
+
+section "adapter: USB id + kernel driver"
+lsusb | grep -iE "wireless|wlan|802|ralink|mediatek|realtek|atheros" || lsusb
+DRVPATH=$(readlink -f "/sys/class/ieee80211/$PHY/device/driver" 2>/dev/null || true)
+echo "driver path: ${DRVPATH:-not found}"
+DRV=$(basename "${DRVPATH:-}")
+[ -n "$DRV" ] && modinfo "$DRV" 2>/dev/null | grep -E "^filename|^description|^version"
+
+section "iw phy $PHY info (FULL - what the driver registers with nl80211)"
+iw phy "$PHY" info
+
+section "iw dev / iw reg get"
+iw dev
+iw reg get
+
+section "ldn package version + vendored upstream revision"
+./.venv/bin/pip show ldn 2>/dev/null | sed -n '1,2p'
+sed -n '/^## Upstream$/,/^## /p' vendor/LDN/UPSTREAM.md 2>/dev/null
+
+section "EXPERIMENT 1: plain iw creates an AP vif (no Python, no ldn library)"
+echo "+ iw phy $PHY interface add ldn-ap-test type __ap"
+if iw phy "$PHY" interface add ldn-ap-test type __ap; then
+    echo "UNEXPECTED SUCCESS - AP vif created; cleaning up"
+    iw dev ldn-ap-test del
+fi
+
+section "EXPERIMENT 2 (control): plain iw creates a MONITOR vif"
+echo "+ iw phy $PHY interface add ldn-mon-test type monitor"
+if iw phy "$PHY" interface add ldn-mon-test type monitor; then
+    echo "monitor vif created OK (control passes - only the AP type is rejected)"
+    iw dev ldn-mon-test del
+fi
+
+echo
+echo "Report written to $OUT"

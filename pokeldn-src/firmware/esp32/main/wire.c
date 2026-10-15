@@ -1,0 +1,326 @@
+#include "wire.h"
+
+#include <stdarg.h>
+#include <stdatomic.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#include "driver/uart.h"
+#include "esp_system.h"
+#include "esp_timer.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/queue.h"
+#include "freertos/task.h"
+
+#define WIRE_UART UART_NUM_0
+#define MSG_LOG 0x83
+#define MSG_CREDIT 0x8B
+/* A CREDIT goes out every CREDIT_STEP bytes read, and when the line falls idle. The host keeps
+   under half the 16 KB RX ring in flight, so a command waiting on a full Wi-Fi queue stalls the
+   host and never overflows the ring. docs/hardware_esp32.md, The serial ceiling. */
+#define CREDIT_STEP 1024
+
+typedef struct {
+    uint16_t length;
+    uint8_t bytes[];   /* type, payload */
+} message_t;
+
+/* The queue drops on memory, not on count: 128 entries filled at 96 KB of free heap during a
+   Scarlet burst and dropped 337 messages. The floor keeps room for the driver's RX buffers.
+   docs/hardware_esp32.md, The serial ceiling. */
+#define WIRE_QUEUE_LENGTH 384
+#define WIRE_HEAP_FLOOR (64 * 1024)
+#define WIRE_UART_EVENTS 64
+
+static QueueHandle_t s_out, s_uart_events;
+static wire_handler_t s_handler;
+static atomic_uint s_dropped, s_rx_bad, s_rx_fifo_ovf, s_rx_buffer_full, s_rx_frame_err, s_events_full;
+static uint32_t s_consumed, s_credited;   /* the reader task's own; the handler runs on it */
+/* Maxima for STATUS: a LOG line is refused at the heap floor, which is when the reader stalls.
+   docs/hardware_esp32.md, The serial ceiling. */
+static atomic_uint s_refused_heap, s_refused_queue, s_heap_min = UINT32_MAX, s_queue_max;
+static atomic_uint s_read_max_us, s_handler_max_us, s_handler_max_type, s_write_max_us;
+
+static void raise_max(atomic_uint *max, uint32_t value)
+{
+    uint32_t seen = atomic_load(max);
+    while (value > seen && !atomic_compare_exchange_weak(max, &seen, value)) {}
+}
+
+static void lower_min(atomic_uint *min, uint32_t value)
+{
+    uint32_t seen = atomic_load(min);
+    while (value < seen && !atomic_compare_exchange_weak(min, &seen, value)) {}
+}
+
+static uint32_t crc32(const uint8_t *p, size_t n)
+{
+    uint32_t crc = UINT32_MAX;
+    while (n--) {
+        crc ^= *p++;
+        for (int i = 0; i < 8; ++i) crc = (crc >> 1) ^ (0xedb88320U & (0U - (crc & 1)));
+    }
+    return ~crc;
+}
+
+bool wire_send_wait(uint8_t type, const void *head, size_t head_len, const void *body,
+                    size_t body_len, uint32_t ticks)
+{
+    const size_t length = 1 + head_len + body_len;
+    if (length > WIRE_MAX_PAYLOAD + 1) return false;
+    const uint32_t heap = esp_get_free_heap_size();
+    lower_min(&s_heap_min, heap);
+    if (heap < WIRE_HEAP_FLOOR + length) { atomic_fetch_add(&s_refused_heap, 1); return false; }
+    message_t *m = malloc(sizeof(*m) + length);
+    if (!m) { atomic_fetch_add(&s_refused_heap, 1); return false; }
+    m->length = length;
+    m->bytes[0] = type;
+    if (head_len) memcpy(m->bytes + 1, head, head_len);
+    if (body_len) memcpy(m->bytes + 1 + head_len, body, body_len);
+    if (xQueueSend(s_out, &m, ticks) != pdTRUE) {
+        free(m);
+        atomic_fetch_add(&s_refused_queue, 1);
+        return false;
+    }
+    raise_max(&s_queue_max, uxQueueMessagesWaiting(s_out));
+    return true;
+}
+
+void wire_send(uint8_t type, const void *head, size_t head_len, const void *body, size_t body_len)
+{
+    if (!wire_send_wait(type, head, head_len, body, body_len, 0)) atomic_fetch_add(&s_dropped, 1);
+}
+
+void wire_log(const char *format, ...)
+{
+    char line[160];
+    va_list ap;
+    va_start(ap, format);
+    int n = vsnprintf(line, sizeof(line), format, ap);
+    va_end(ap);
+    if (n < 0) return;
+    if (n >= (int)sizeof(line)) n = sizeof(line) - 1;
+    wire_send(MSG_LOG, line, n, NULL, 0);
+}
+
+uint32_t wire_dropped(void) { return atomic_load(&s_dropped); }
+uint32_t wire_rx_bad(void) { return atomic_load(&s_rx_bad); }
+uint32_t wire_rx_fifo_ovf(void) { return atomic_load(&s_rx_fifo_ovf); }
+uint32_t wire_rx_buffer_full(void) { return atomic_load(&s_rx_buffer_full); }
+uint32_t wire_rx_frame_err(void) { return atomic_load(&s_rx_frame_err); }
+uint32_t wire_events_full(void) { return atomic_load(&s_events_full); }
+
+int wire_stats(char *text, size_t size)
+{
+    return snprintf(text, size,
+        "refused_heap=%u refused_queue=%u heap_min=%u queue_max=%u read_max_us=%u "
+        "handler_max_us=%u handler_max_type=%#x write_max_us=%u",
+        atomic_load(&s_refused_heap), atomic_load(&s_refused_queue), atomic_load(&s_heap_min),
+        atomic_load(&s_queue_max), atomic_load(&s_read_max_us), atomic_load(&s_handler_max_us),
+        atomic_load(&s_handler_max_type), atomic_load(&s_write_max_us));
+}
+
+/* A CREDIT jumps the queue and carries the count current when the writer reaches it: behind a
+   console burst's RX_ETH it arrived 0.51 s late and the host resynced over no loss.
+   docs/hardware_esp32.md, The serial ceiling. */
+static atomic_uint s_credit_value;
+static atomic_bool s_credit_queued;
+static int64_t s_credit_at;   /* the reader's own: when it last repeated an idle count */
+
+static void send_credit(void)
+{
+    s_credited = s_consumed;
+    atomic_store(&s_credit_value, s_credited);
+    if (atomic_exchange(&s_credit_queued, true)) return;
+    message_t *m = malloc(sizeof(*m) + 5);
+    if (m) {
+        m->length = 5;
+        m->bytes[0] = MSG_CREDIT;
+        if (xQueueSendToFront(s_out, &m, 0) == pdTRUE) return;
+        free(m);
+    }
+    atomic_store(&s_credit_queued, false);
+    atomic_fetch_add(&s_dropped, 1);
+}
+
+/* A CREDIT of 0 at once, so the host's window is shut from the first byte after the HELLO. */
+void wire_credit_reset(void)
+{
+    s_consumed = 0;
+    send_credit();
+}
+
+/* A zero-length queue entry carrying the rate: the writer switches when it reaches it, so every
+   message queued before it (the BAUD RESULT above all) leaves at the old rate. A flag checked on
+   an empty queue raced the RESULT while RX_MGMT kept the writer busy. */
+void wire_set_baud(uint32_t baud)
+{
+    message_t *m = malloc(sizeof(*m) + 4);
+    if (!m) return;
+    m->length = 0;
+    memcpy(m->bytes, &baud, 4);
+    if (xQueueSend(s_out, &m, portMAX_DELAY) != pdTRUE) free(m);
+}
+
+static void writer(void *arg)
+{
+    static uint8_t frame[WIRE_MAX_PAYLOAD + 8], encoded[WIRE_MAX_PAYLOAD + 32];
+    for (;;) {
+        message_t *m;
+        if (xQueueReceive(s_out, &m, portMAX_DELAY) != pdTRUE) continue;
+        const size_t n = m->length;
+        if (!n) {
+            uint32_t baud;
+            memcpy(&baud, m->bytes, 4);
+            free(m);
+            /* The 16 KB TX ring can hold a second and more at 115200; a 100 ms wait switched
+               the rate with the RESULT still in it. */
+            uart_wait_tx_done(WIRE_UART, pdMS_TO_TICKS(3000));
+            uart_set_baudrate(WIRE_UART, baud);
+            continue;
+        }
+        memcpy(frame, m->bytes, n);
+        free(m);
+        /* uart_write_bytes spins on a full TX ring (IDF 6.1 uart.c:1662) and this task outranks
+           the reader on its core, which it starved in the middle of esp_wifi_internal_tx: 111 ms
+           sends under a line-rate flood. Sleep until the frame fits. docs/hardware_esp32.md */
+        const size_t need = n + 4 + (n + 4) / 254 + 2 + 32;
+        const int64_t waited = esp_timer_get_time();
+        for (size_t free_size = 0;
+             uart_get_tx_buffer_free_size(WIRE_UART, &free_size) == ESP_OK && free_size < need;)
+            vTaskDelay(1);
+        raise_max(&s_write_max_us, esp_timer_get_time() - waited);
+        if (frame[0] == MSG_CREDIT && n == 5) {
+            atomic_store(&s_credit_queued, false);
+            const uint32_t credit = atomic_load(&s_credit_value);
+            memcpy(frame + 1, &credit, 4);
+        }
+        const uint32_t crc = crc32(frame, n);
+        memcpy(frame + n, &crc, 4);
+        size_t out = 1, code_at = 0;
+        uint8_t code = 1;
+        for (size_t i = 0; i < n + 4; ++i) {
+            if (!frame[i]) { encoded[code_at] = code; code_at = out++; code = 1; continue; }
+            encoded[out++] = frame[i];
+            if (++code == 255) { encoded[code_at] = code; code_at = out++; code = 1; }
+        }
+        encoded[code_at] = code;
+        encoded[out++] = 0;
+        uart_write_bytes(WIRE_UART, encoded, out);
+    }
+}
+
+/* The ISR posts UART_DATA every 32 bytes into the queue that carries the overflow events (IDF 6.1
+   uart.c:1369, 1543): 64 entries fill in 14 ms at 1500000 and the ISR drops the rest. Counted on a
+   task above the reader, every tick. docs/hardware_esp32.md, The serial ceiling. */
+static void events(void *arg)
+{
+    for (;;) {
+        if (uxQueueMessagesWaiting(s_uart_events) >= WIRE_UART_EVENTS) atomic_fetch_add(&s_events_full, 1);
+        uart_event_t event;
+        while (xQueueReceive(s_uart_events, &event, 0) == pdTRUE) {
+            if (event.type == UART_FIFO_OVF) atomic_fetch_add(&s_rx_fifo_ovf, 1);
+            else if (event.type == UART_BUFFER_FULL) atomic_fetch_add(&s_rx_buffer_full, 1);
+            else if (event.type == UART_FRAME_ERR || event.type == UART_PARITY_ERR ||
+                     event.type == UART_BREAK) atomic_fetch_add(&s_rx_frame_err, 1);
+        }
+        vTaskDelay(1);
+    }
+}
+
+/* A frame that fails here is a command lost between host and board; wire_rx_bad counts them. */
+static void deliver(const uint8_t *encoded, size_t used)
+{
+    static uint8_t frame[WIRE_MAX_PAYLOAD + 8];
+    size_t read = 0, out = 0;
+    while (read < used) {
+        const uint8_t code = encoded[read++];
+        if (!code || read + code - 1 > used || out + code > sizeof(frame)) {
+            atomic_fetch_add(&s_rx_bad, 1);
+            return;
+        }
+        for (int i = 1; i < code; ++i) frame[out++] = encoded[read++];
+        if (code != 255 && read < used) frame[out++] = 0;
+    }
+    uint32_t crc;
+    if (out < 5 || (memcpy(&crc, frame + out - 4, 4), crc != crc32(frame, out - 4))) {
+        atomic_fetch_add(&s_rx_bad, 1);
+        return;
+    }
+    const int64_t started = esp_timer_get_time();
+    s_handler(frame[0], frame + 1, out - 5);
+    const int64_t took = esp_timer_get_time() - started;
+    if (took > atomic_load(&s_handler_max_us)) {
+        atomic_store(&s_handler_max_us, took);
+        atomic_store(&s_handler_max_type, frame[0]);
+    }
+    if (took > 50000) wire_log("slow command 0x%02x: %u ms", frame[0], (unsigned)(took / 1000));
+}
+
+/* The UART driver is installed here, on core 1, because its interrupt is allocated on the core
+   that installs it. On core 0, with the Wi-Fi task, a console's receive flood lost 500 host
+   commands in 7 s and none after. docs/hardware_esp32.md, The serial ceiling. */
+static void reader(void *arg)
+{
+    const uart_config_t config = {
+        .baud_rate = 115200,
+        .data_bits = UART_DATA_8_BITS,
+        .parity = UART_PARITY_DISABLE,
+        .stop_bits = UART_STOP_BITS_1,
+        .flow_ctrl = UART_HW_FLOWCTRL_DISABLE,
+        .source_clk = UART_SCLK_DEFAULT,
+    };
+    ESP_ERROR_CHECK(uart_driver_install(WIRE_UART, 16384, 16384, WIRE_UART_EVENTS, &s_uart_events, 0));
+    ESP_ERROR_CHECK(uart_param_config(WIRE_UART, &config));
+    /* With CONFIG_ESP_CONSOLE_NONE nothing routes UART0 to GPIO1/3; the board stays mute without this. */
+    ESP_ERROR_CHECK(uart_set_pin(WIRE_UART, 1, 3, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE));
+    /* The driver drains the 128-byte FIFO at 120 by default: 8 bytes, 53 us at 1500000, and a
+       Scarlet seat's opening overflowed it 235 times. At 32 the margin is 640 us.
+       docs/hardware_esp32.md, The serial ceiling. */
+    ESP_ERROR_CHECK(uart_set_rx_full_threshold(WIRE_UART, 32));
+    xTaskCreatePinnedToCore(writer, "wire_tx", 4096, NULL, 20, NULL, 1);
+    xTaskCreatePinnedToCore(events, "wire_ev", 2048, NULL, 21, NULL, 1);
+    static uint8_t chunk[512], encoded[WIRE_MAX_PAYLOAD + 32];
+    size_t used = 0;
+    bool overflow = false;
+    for (;;) {
+        const int64_t turn = esp_timer_get_time();
+        /* uart_read_bytes waits its timeout again for every ring item until `length` is met: a
+           host trickling 21-byte commands every 15 ms was read 461 ms late. Wait for one byte,
+           then take what is buffered. docs/hardware_esp32.md, The serial ceiling. */
+        size_t buffered = 0;
+        uart_get_buffered_data_len(WIRE_UART, &buffered);
+        const int n = buffered
+            ? uart_read_bytes(WIRE_UART, chunk, buffered < sizeof(chunk) ? buffered : sizeof(chunk), 0)
+            : uart_read_bytes(WIRE_UART, chunk, 1, pdMS_TO_TICKS(20));
+        raise_max(&s_read_max_us, esp_timer_get_time() - turn);
+        /* Idle, the reader repeats its count every 100 ms: a host whose window stays shut under
+           a repeated count knows the rest was lost on the line, and a silent board is busy. */
+        if (n <= 0 && (s_consumed != s_credited || turn - s_credit_at > 100000)) {
+            s_credit_at = turn;
+            send_credit();
+        }
+        for (int i = 0; i < n; ++i) {
+            ++s_consumed;   /* before the handler, so a HELLO's reset excludes its own delimiter */
+            if (chunk[i]) {
+                if (used < sizeof(encoded)) encoded[used++] = chunk[i]; else overflow = true;
+                continue;
+            }
+            if (used && overflow) atomic_fetch_add(&s_rx_bad, 1);
+            if (used && !overflow) deliver(encoded, used);
+            used = 0;
+            overflow = false;
+        }
+        if (s_consumed - s_credited >= CREDIT_STEP) send_credit();
+        const int64_t held = esp_timer_get_time() - turn;
+        if (held > 100000) wire_log("reader held %u ms", (unsigned)(held / 1000));
+    }
+}
+
+void wire_start(wire_handler_t handler)
+{
+    s_handler = handler;
+    s_out = xQueueCreate(WIRE_QUEUE_LENGTH, sizeof(message_t *));
+    xTaskCreatePinnedToCore(reader, "wire_rx", 6144, NULL, 19, NULL, 1);
+}
