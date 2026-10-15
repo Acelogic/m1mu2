@@ -1,0 +1,6 @@
+# VAR 0x4024: GetVarPointer hands back the var's address, read16:prev reads the u16 there, and
+# the word at 0x030042D0 rides along in the same join.
+.call GetVarPointer 0x4024
+.peek prev 2
+.peek 0x030042D0
+.go var4024
