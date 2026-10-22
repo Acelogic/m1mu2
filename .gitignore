@@ -3,3 +3,7 @@ captures/
 __pycache__/
 .venv/
 keys/
+.DS_Store
+.pytest_cache/
+.ruff_cache/
+.claude/
