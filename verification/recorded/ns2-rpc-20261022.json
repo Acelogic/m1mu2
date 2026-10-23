@@ -1,0 +1,28 @@
+{
+  "schema": "m1mu2.ns2.published-readback-summary.v1",
+  "sanitizedDerivative": true,
+  "notAnNs2ReplayReceipt": true,
+  "omitted": ["session identity", "absolute host paths", "raw command output"],
+  "originalRunReceiptSha256": "b85d79ca19ef456789fac3e87471590bc2075c2b00cfc3de3dcc280bbff8efa9",
+  "recordedAt": "2026-10-22T19:20:34.968774+00:00",
+  "evidence": "live existing Switch RPC via m1mu2 REPL",
+  "scope": "application-sdk",
+  "sdkOffset": "0x4CC0",
+  "length": 32,
+  "captureFile": "ns2-rpc-20261022.bin",
+  "expectedSha256": "2fd3478366e5533361fdb8b68e0547e360c7924718fd5ba81565e797ada30627",
+  "sha256": "2fd3478366e5533361fdb8b68e0547e360c7924718fd5ba81565e797ada30627",
+  "matchesVerifiedInstructions": true,
+  "sourceByteWrites": false,
+  "rpcScratchMayChange": true,
+  "liveCommandExit": 0,
+  "offlineReplayExit": 0,
+  "sysmoduleAccessProven": false,
+  "hardwareIdentityIndependentlyVerified": false,
+  "fsAcquisition": "failed; cleanup acknowledged",
+  "sourceSha256": {
+    "m1mu2/ns2.py": "8ac95940543d04599b431168b9e3e5a57249b7dd0ba70915a781420921649ddd",
+    "m1mu2/ns2_rpc.py": "dc723fc4bc83f5f5ad5078e4678ca404d553af063d236f149e8f4f1ff495ee98",
+    "m1mu2/entry.py": "35552e83eaf9375dfd509ce9f47202b1958dbf3aca9a760e6691e84b2d06ae34"
+  }
+}

@@ -7,3 +7,8 @@ keys/
 .pytest_cache/
 .ruff_cache/
 .claude/
+verification/artifacts/
+verification/ns2_view_receipt.json
+verification/ns2-actual-session-repl.json
+verification/summary.json
+verification/*.png

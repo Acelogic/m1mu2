@@ -20,7 +20,7 @@ import os
 from datetime import datetime, timezone
 from pathlib import Path
 
-from .upstream import REPO_ROOT
+REPO_ROOT = Path(__file__).resolve().parent.parent
 
 DEFAULT_JOURNAL = REPO_ROOT / "captures" / "m1mu2" / "journal.jsonl"
 RESERVED = ("seq", "utc", "kind")

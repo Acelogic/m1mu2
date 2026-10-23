@@ -1,4 +1,4 @@
-"""python -m m1mu2 repl | run FILE.muprog - see m1mu2.cli."""
-from .cli import main
+"""python -m m1mu2: select Switch 2 or the existing FireRed workflow."""
+from .entry import main
 
 raise SystemExit(main())

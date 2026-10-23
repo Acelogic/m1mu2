@@ -1,5 +1,148 @@
 # m1mu²
 
+<p align="center">
+  <img src="assets/m1mu2-banner.png" alt="M1μ² — memory probing workbench" width="100%">
+</p>
+
+**Memory probing for Switch 2 through ns2jb, with a separate FireRed/GBA backend.**
+
+m1mu² provides a command-line workbench, interactive REPL, and local capture viewer for
+inspecting memory and keeping reproducible results. Switch 2 support integrates with an existing
+[ns2jb](https://gitlab.com/pepsipu/ns2jb) session: inspect saved captures, probe the application's
+native RPC, and perform bounded reads through a qualified retained filesystem-service endpoint.
+See [pepsipu's Switch 2 jailbreak write-up](https://pepsipu.com/blog/2026-10-switch2-jailbreak-ns2jb/)
+for the underlying jailbreak and its broader capabilities.
+
+The FireRed backend probes the game's GBA runtime through the vendored Mystery Gift host.
+The two backends use separate transports and address spaces.
+
+## Current support
+
+| Capability | Status |
+|---|---|
+| Switch 2 application RPC probing | **Live read recorded on October 22, 2026:** 32 SDK instruction bytes matched the saved signature; offline replay passed. |
+| Switch 2 capture inspection, REPL, and browser viewer | Available; saved captures can be inspected without contacting the console. |
+| Switch 2 retained FS/sysmodule memory reads | Adapter implemented and verified against local protocol fixtures. **Live FS acquisition remains unqualified** in the recorded session. |
+| FireRed/GBA probing | Existing Mystery Gift workflow, including a saved hardware health-probe capture and offline replay. |
+
+The application probe establishes a narrow readback result. USER/SYSTEM mounts, Mario Kart World
+files/assets, and live FS sysmodule reads have not been demonstrated by m1mu². The workbench
+uses existing sessions; it does not run the jailbreak or install a native payload.
+
+## Setup
+
+Use **Python 3.13 or newer**. The Switch backend uses the Python standard library and requires
+a POSIX host such as macOS or Linux for file locking and UNIX sockets.
+
+```bash
+git clone https://github.com/Acelogic/m1mu2.git
+cd m1mu2
+python3.13 -m venv .venv
+.venv/bin/python -m m1mu2 --help
+```
+
+Run the examples from the repository root. `ns2` (alias `switch2`) selects Switch 2;
+`frlg` selects FireRed. Existing `repl` and `run` commands retain their FireRed behavior.
+For FireRed and its regression suite, also install the host dependencies:
+
+```bash
+.venv/bin/python -m pip install -r requirements.txt
+```
+
+## Switch 2 / ns2jb
+
+The adapter expects the session files, qualification reports, and bridge endpoints from the
+existing ns2jb/Explorer bench setup. These are external prerequisites, not created by m1mu².
+Application probing uses the local HTTP RPC bridge; retained FS reads additionally use its
+memory-reader UNIX socket. Importing this backend does not load the FireRed host or its radio.
+
+### Inspect an existing session
+
+Select your own session directory. These commands inspect local evidence without contacting
+the console:
+
+```bash
+export M1MU2_SESSION="/absolute/path/to/ns2-explorer/.state/session-YOUR-ID"
+
+.venv/bin/python -m m1mu2 ns2 status --session-dir "$M1MU2_SESSION"
+.venv/bin/python -m m1mu2 ns2 captures --session-dir "$M1MU2_SESSION"
+.venv/bin/python -m m1mu2 ns2 repl --session-dir "$M1MU2_SESSION"
+.venv/bin/python -m m1mu2 ns2 view --session-dir "$M1MU2_SESSION" --port 8788
+```
+
+Open <http://127.0.0.1:8788/> for the passive viewer. It shows acquisition stages, hex previews,
+and downloads of complete, hash-verified captures. Refresh reads local files only. Control files
+whose addresses are unknown remain labeled as evidence rather than mapped sysmodule memory.
+
+The REPL supports `status`, `captures`, `rpc-probe`, `read ADDRESS LENGTH` (alias `peek`),
+`replay RECEIPT`, `help`, and `quit`. Session/report selection and live mode are fixed at startup.
+It does not evaluate Python or shell commands. A failed command halts the session without
+retrying a read.
+
+### Probe the application RPC
+
+`rpc-probe` reads exactly 32 bytes at the selected session's SDK + `0x4CC0` and compares them
+with its saved instruction signature. It requires completed application qualification and
+confirmed acquisition cleanup, and verifies the RX mapping before and after the read.
+An idle, qualified application's RPC can be probed even when FS acquisition did not succeed.
+
+```bash
+# Inspect the plan without contacting the console:
+.venv/bin/python -m m1mu2 ns2 rpc-probe --session-dir "$M1MU2_SESSION"
+
+# Perform the fixed probe on the qualified, idle session:
+.venv/bin/python -m m1mu2 ns2 rpc-probe --session-dir "$M1MU2_SESSION" --live
+```
+
+For interactive probing, start `ns2 repl --session-dir "$M1MU2_SESSION" --live`, then enter
+`rpc-probe` and `quit`. The native RPC updates its own scratch output; it does not write the
+probed code. This command does not expose arbitrary reads or qualify FS sysmodule access.
+
+### Bounded FS reads and replay
+
+`ns2 read` requires `--session-dir`, `--report`, `--address`, and `--length`. The address range
+must lie wholly inside a prior complete, verified capture from the selected acquisition report.
+Use `ns2 read --help` for the CLI options, or start the REPL with `--report PATH` and enter `help`.
+
+Reads default to dry-run. `--live` enables the existing retained reader, with a maximum of
+6 MiB per request. Session, report, boot identity, endpoint ownership, readiness, pending
+operations, capture hashes, and response lengths are checked before accepting bytes. Active
+Explorer acquisitions are refused. An upstream retained read can change its internal pointer
+state; the requested target bytes are not written.
+
+Each successful live read or application probe saves a new read-only `.bin`, a JSON receipt,
+and a journal entry under `captures/ns2/` (or `--captures`). Receipts record session identity,
+source, address, length, and SHA-256 without credentials. Replay verifies the saved bytes offline:
+
+```bash
+.venv/bin/python -m m1mu2 ns2 replay --capture /absolute/path/to/capture-receipt.json
+```
+
+Never reuse a session directory after restarting or reconnecting the Switch. The per-session
+lock coordinates m1mu² readers only; keep other clients off the same endpoint during a read.
+Ambiguous hardware requests are never retried automatically. A bridge `status` response reports
+local readiness; matching readback bytes provide the application-probe evidence.
+
+### Recorded hardware result
+
+On **October 22, 2026 at 19:20 UTC**, `rpc-probe` passed through the m1mu² REPL: 32 bytes at
+SDK + `0x4CC0` matched the saved instruction signature, with matching RX maps before and after.
+Offline replay also passed. The [published readback summary](verification/recorded/ns2-rpc-20261022.json)
+preserves the result, source hashes, and SHA-256 of the [32 captured bytes](verification/recorded/ns2-rpc-20261022.bin).
+It is a sanitized derivative of the local run receipt, with session identifiers and host paths
+omitted, rather than a receipt accepted by `ns2 replay`. Its scope is `application-sdk`;
+it does not independently attest the hardware identity. Verify the published bytes with:
+
+```bash
+shasum -a 256 verification/recorded/ns2-rpc-20261022.bin
+```
+
+FS acquisition in that session had stopped at
+`Field copy did not qualify within its attempt limit: combined-leak-0-1`, with cleanup acknowledged.
+The successful application probe does not change that FS result. No game patches were applied.
+
+## FireRed / GBA backend
+
 Bench orchestrator for read-only memory probes on our licensed FireRed cartridge, running in the
 Switch's GBA runtime, through the vendored Mystery Gift host (`pokeldn-src/bin/frlg_mg_host.py`).
 You write a few steps, m1mu² compiles them into the one buffer-script program a join carries,
@@ -15,7 +158,7 @@ m1mu2> .peek 0x030042D0
 m1mu2> .go var4024
 ```
 
-## Safety posture
+### FireRed safety posture
 
 - **Dry-run is the default.** Nothing reaches the radio unless you pass `--live`, and even then
   every join stops at a confirmation prompt that restates the console precondition (Mystery Gift →
@@ -55,7 +198,7 @@ m1mu2> .go var4024
   crash-report noise) to `.stderr.log`, and journals everything to `captures/m1mu2/journal.jsonl`
   (append-only, replayable offline with `python -m m1mu2.replay`).
 
-## Quickstart (once hardware is present)
+### FireRed quickstart (once hardware is present)
 
 The venv needs everything in `requirements.txt` (`pytest` fails if the live path's imports do not
 resolve). Run the rig's identity and heartbeat checks from CLAUDE.md's appendix first (esptool
@@ -67,7 +210,7 @@ friends search, then:
 ```
 
 ```bash
-.venv/bin/python -m m1mu2.cli run probes/health.muprog --live --no-sudo --mac 20:50:0d:d1:15:20
+.venv/bin/python -m m1mu2.cli run probes/health.muprog --live --no-sudo --mac YOUR_CONSOLE_MAC
 ```
 
 The first prints the exact command and the host's verdict on it; the second fires it after your
@@ -77,7 +220,7 @@ cached credentials, and macOS caches them per terminal: a `sudo -v` only counts 
 that then runs m1mu², and a shell with no terminal (an agent's) never has any, so the join comes
 back `not-started`.
 
-## What a join is
+### What a FireRed join is
 
 One join runs one `--buffer-script`. Only two take steps, and they are different payloads
 (`pokeldn-src/asm/sloop-svc.s`, `asm/call-chain.s`):
@@ -102,6 +245,10 @@ budget, ⌈log₂ N⌉ probes worst case. It never spends joins on bisection by 
 
 | module | role |
 |---|---|
+| `m1mu2/entry.py` | selects Switch 2 or FireRed; preserves the existing `repl` and `run` commands |
+| `m1mu2/ns2.py` | Switch session checks, capture inspection, bounded retained reads, replay, and REPL |
+| `m1mu2/ns2_rpc.py` | fixed application SDK probe through an existing qualified RPC bridge |
+| `m1mu2/ns2_view.py`, `m1mu2/ns2_view.html` | passive local Switch capture viewer |
 | `m1mu2/upstream.py` | imports `pokeldn-src` in place; `check_host_argv` = the host's own validation, offline |
 | `m1mu2/policy.py` | what goes without `--allow-unsafe`, and what never goes |
 | `m1mu2/pack.py` | steps → joins → buffer-script argv, and back (`join_from_host_args`) |
@@ -147,13 +294,33 @@ Observed in `pokeldn-src/` while building this milestone; m1mu² follows the cod
    test stops before the transport, so nothing caught it. Both are now in `requirements.txt`, and
    `tests/test_env.py` imports the live path's modules so a venv without them fails `pytest`.
 
-## Tests
+## Verification
+
+Switch E2E checks run the actual CLI, REPL, and viewer against deterministic local fixtures:
+
+```bash
+.venv/bin/python verification/ns2_e2e.py
+.venv/bin/python verification/ns2_view_e2e.py
+.venv/bin/python verification/ns2_rpc_e2e.py
+```
+
+| Harness | Coverage | Repeatable artifact |
+|---|---|---|
+| `ns2_e2e.py` | CLI/REPL, HTTP/UNIX reader protocol, capture integrity, refusals, and replay | `verification/artifacts/ns2-*/receipt.json`, transcripts, and captures |
+| `ns2_view_e2e.py` | Viewer HTTP interface, byte-identical downloads, tamper rejection, foreign Host rejection, and refusal of device operations | `verification/ns2_view_receipt.json` |
+| `ns2_rpc_e2e.py` | Application probe through CLI/REPL, qualification checks, failures, and replay | `verification/artifacts/ns2-rpc-*/receipt.json` |
+
+These are software/protocol checks. Each harness prints its receipt location; generated run
+artifacts stay local. The separate dated readback summary above documents the recorded live
+application read and its limits.
+
+Run the existing FireRed regression suite after installing `requirements.txt`:
 
 ```bash
 .venv/bin/python -m pytest
 ```
 
-No hardware, no subprocess of the host, no `sudo`. Most result-parser fixtures are **synthetic**
+The FireRed suite uses no hardware, host subprocess, or `sudo`. Most result-parser fixtures are **synthetic**
 (answer blocks and logs built to the documented formats), so they can cover crashes, ghosts and
 stops. `tests/fixtures/real/` holds the first hardware capture, the answered health join of
 2026-10-15, which `tests/test_real_capture.py` classifies. Upstream's Unicorn self-tests do not run

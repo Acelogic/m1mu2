@@ -1,11 +1,11 @@
 [project]
 name = "m1mu2"
 version = "0.1.0"
-description = "Bench orchestrator for FireRed Mystery Gift memory-read probes over frlg_mg_host.py"
+description = "Memory probe workbench for FireRed and read-only Switch 2 sysmodule inspection"
 requires-python = ">=3.13"
 
 [project.scripts]
-m1mu2 = "m1mu2.cli:main"
+m1mu2 = "m1mu2.entry:main"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
